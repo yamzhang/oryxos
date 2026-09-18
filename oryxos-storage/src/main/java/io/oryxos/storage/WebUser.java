@@ -9,7 +9,7 @@ import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
 import java.time.Instant;
 
-/** 管理台 Basic Auth 账号——表结构以手工 schema.sql 为唯一权威。 */
+/** 管理台 Basic Auth 账号——表结构以 db/migration 迁移目录为唯一权威。 */
 @Entity
 @Table(name = "web_users")
 public class WebUser {
@@ -26,6 +26,14 @@ public class WebUser {
 
   @Column(nullable = false)
   private boolean enabled;
+
+  /**
+   * 角色集合的规范化序列（039）：逗号分隔、大写、按 VIEWER,EDITOR,ADMIN 顺序；缺省 VIEWER。
+   *
+   * <p>解析/序列化收在 {@link WebUserService}，本字段只做落库映射。
+   */
+  @Column(name = "roles", nullable = false)
+  private String roles = "VIEWER";
 
   @Column(name = "created_at", nullable = false)
   private Instant createdAt;
@@ -69,6 +77,14 @@ public class WebUser {
 
   public void setEnabled(boolean enabled) {
     this.enabled = enabled;
+  }
+
+  public String getRoles() {
+    return roles;
+  }
+
+  public void setRoles(String roles) {
+    this.roles = roles;
   }
 
   public Instant getCreatedAt() {

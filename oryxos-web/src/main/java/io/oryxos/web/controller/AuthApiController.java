@@ -1,5 +1,8 @@
 package io.oryxos.web.controller;
 
+import io.oryxos.core.auth.Role;
+import io.oryxos.storage.AuthEventRecorder;
+import io.oryxos.storage.AuthEventType;
 import io.oryxos.storage.WebSession;
 import io.oryxos.storage.WebSessionService;
 import io.oryxos.storage.WebUserService;
@@ -7,11 +10,15 @@ import io.oryxos.web.common.ApiResponse;
 import io.oryxos.web.config.WebAuthProperties;
 import io.oryxos.web.controller.dto.AuthMeView;
 import io.oryxos.web.controller.dto.LoginRequest;
+import io.oryxos.web.security.ClientIp;
+import io.oryxos.web.security.LoginAttemptService;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.Optional;
+import java.util.Set;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
@@ -40,21 +47,35 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/v1/auth")
 public class AuthApiController {
 
-  /** cookie 名。 */
-  static final String SESSION_COOKIE = "oryxos_session";
+  /** cookie 名（OIDC callback 与密码登录共用）。 */
+  public static final String SESSION_COOKIE = "oryxos_session";
+
+  /** 锁定期内的 429 文案：不透露阀值/剩余次数，不区分账号存否。 */
+  private static final String TOO_MANY_ATTEMPTS_MESSAGE =
+      "Too many failed login attempts, try again later";
 
   private final WebUserService userService;
   private final WebSessionService sessionService;
   private final WebAuthProperties properties;
+  private final LoginAttemptService loginAttemptService;
+  private final AuthEventRecorder authEventRecorder;
 
   public AuthApiController(
-      WebUserService userService, WebSessionService sessionService, WebAuthProperties properties) {
+      WebUserService userService,
+      WebSessionService sessionService,
+      WebAuthProperties properties,
+      LoginAttemptService loginAttemptService,
+      AuthEventRecorder authEventRecorder) {
     this.userService = userService;
     this.sessionService = sessionService;
     this.properties = properties;
+    this.loginAttemptService = loginAttemptService;
+    this.authEventRecorder = authEventRecorder;
   }
 
-  /** 登录：验账密 → 建 session → 设 cookie。失败 401（"Invalid username or password"，不区分原因防枚举）。 */
+  /**
+   * 登录：验账密 → 废旧 session → 建新 session → 设 cookie。失败 401（"Invalid username or password"，不区分原因防枚举）。
+   */
   @PostMapping("/login")
   public ApiResponse<AuthMeView> login(
       @RequestBody LoginRequest loginRequest,
@@ -69,25 +90,41 @@ public class AuthApiController {
       return ApiResponse.error(
           HttpStatus.BAD_REQUEST.value(), "username and password are required");
     }
+    // 暴力破解防护：同「用户名|来源 IP」连续失败超限即 429，不碰密码校验（锁定期内也不给密码探针）。
+    String attemptKey = loginRequest.username() + "|" + ClientIp.peerAddress(request);
+    if (loginAttemptService.isBlocked(attemptKey)) {
+      response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+      return ApiResponse.error(HttpStatus.TOO_MANY_REQUESTS.value(), TOO_MANY_ATTEMPTS_MESSAGE);
+    }
     if (!userService.verify(loginRequest.username(), loginRequest.password())) {
+      loginAttemptService.onFailure(attemptKey);
       response.setStatus(HttpStatus.UNAUTHORIZED.value());
       return ApiResponse.error(HttpStatus.UNAUTHORIZED.value(), "Invalid username or password");
     }
+    loginAttemptService.onSuccess(attemptKey);
+    // 重新登录废掉旧 session：旧 id 不能继续用，也不在库里堆孤儿行等自然过期。
+    findSessionId(request).ifPresent(sessionService::delete);
     WebSession session = sessionService.create(loginRequest.username());
     response.addHeader(
         HttpHeaders.SET_COOKIE, buildCookie(session.getSessionId(), -1, request.isSecure()));
-    return ApiResponse.ok(new AuthMeView(properties.isEnabled(), loginRequest.username()));
+    return ApiResponse.ok(meView(properties.isEnabled(), loginRequest.username()));
   }
 
-  /** 登出：清当前 session + 清 cookie。幂等（无 session 也成功）。 */
+  /** 登出：清当前 session + 清 cookie。幂等（无 session 也成功）。附带 auth_events LOGOUT（best-effort）。 */
   @PostMapping("/logout")
   public ApiResponse<Void> logout(HttpServletRequest request, HttpServletResponse response) {
-    findSessionId(request).ifPresent(sessionService::delete);
+    Optional<String> sessionId = findSessionId(request);
+    String username =
+        sessionId.flatMap(sessionService::findValid).map(WebSession::getUsername).orElse(null);
+    sessionId.ifPresent(sessionService::delete);
     response.addHeader(HttpHeaders.SET_COOKIE, buildCookie("", 0, request.isSecure()));
+    if (username != null) {
+      authEventRecorder.recordBestEffort(AuthEventType.LOGOUT, username, "session logout");
+    }
     return ApiResponse.ok(null);
   }
 
-  /** 查当前登录用户。认证关闭时 200 返开关状态；认证开启时，已登录返用户名、未登录 401。 */
+  /** 查当前登录用户。认证关闭时 200 返开关状态；认证开启时，已登录返用户名与 rolesOf，未登录 401。 */
   @GetMapping("/me")
   public ApiResponse<AuthMeView> me(HttpServletRequest request, HttpServletResponse response) {
     if (!properties.isEnabled()) {
@@ -103,7 +140,26 @@ public class AuthApiController {
       response.setStatus(HttpStatus.UNAUTHORIZED.value());
       return ApiResponse.error(HttpStatus.UNAUTHORIZED.value(), "Not authenticated");
     }
-    return ApiResponse.ok(new AuthMeView(true, session.get().getUsername()));
+    return ApiResponse.ok(meView(true, session.get().getUsername()));
+  }
+
+  /**
+   * 角色只读 {@link WebUserService#rolesOf}，与 ApiKeyAuthFilter 的 session 主体同源。不调用 AuthorizationService。
+   */
+  private AuthMeView meView(boolean authenticationEnabled, String username) {
+    if (username == null || username.isBlank()) {
+      return new AuthMeView(authenticationEnabled, username, Set.of());
+    }
+    Set<Role> parsed = userService.rolesOf(username);
+    Set<String> names = new LinkedHashSet<>();
+    if (parsed != null) {
+      for (Role role : parsed) {
+        if (role != null) {
+          names.add(role.name());
+        }
+      }
+    }
+    return new AuthMeView(authenticationEnabled, username, names);
   }
 
   /** 从请求 cookie 里取 session id。 */

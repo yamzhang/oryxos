@@ -3,6 +3,8 @@ package io.oryxos.web.skill;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -75,7 +77,11 @@ public class GithubFolderFetcher {
   private void fetchDir(Target target, String dirPath, Map<String, String> out, long[] totalBytes) {
     String api =
         "https://api.github.com/repos/%s/%s/contents/%s?ref=%s"
-            .formatted(target.owner(), target.repo(), encodePath(dirPath), target.branch());
+            .formatted(
+                target.owner(),
+                target.repo(),
+                encodePath(dirPath),
+                URLEncoder.encode(target.branch(), StandardCharsets.UTF_8));
     JsonNode entries = parseJson(httpGet.apply(URI.create(api)));
     if (!entries.isArray()) {
       throw new IllegalArgumentException("GitHub 返回的不是一个目录: " + dirPath);
@@ -102,7 +108,8 @@ public class GithubFolderFetcher {
         continue;
       }
       String content = httpGet.apply(URI.create(downloadUrl));
-      totalBytes[0] += content.length();
+      // 按 UTF-8 字节数累计（content.length() 是字符数，中文场景低估内存占用）
+      totalBytes[0] += content.getBytes(StandardCharsets.UTF_8).length;
       if (totalBytes[0] > MAX_TOTAL_BYTES) {
         throw new IllegalArgumentException("目录总大小超过上限（5MB），拒绝导入");
       }
@@ -110,14 +117,19 @@ public class GithubFolderFetcher {
     }
   }
 
+  /**
+   * Contents API 的 path 段允许 {@code '/'}，逐段编码后再拼回去。{@link URLEncoder} 是
+   * application/x-www-form-urlencoded（空格 → {@code +}），GitHub path 需要 URI 百分号编码（空格 → {@code
+   * %20}），否则带空格的目录 会 404。
+   */
   private static String encodePath(String path) {
-    // Contents API 的 path 段允许 '/'，逐段做 URL 编码后再拼回去
     StringBuilder sb = new StringBuilder();
     for (String seg : path.split(PATH_SEPARATOR)) {
       if (!sb.isEmpty()) {
         sb.append('/');
       }
-      sb.append(java.net.URLEncoder.encode(seg, java.nio.charset.StandardCharsets.UTF_8));
+      sb.append(
+          URLEncoder.encode(seg, StandardCharsets.UTF_8).replace("+", "%20").replace("%7E", "~"));
     }
     return sb.toString();
   }

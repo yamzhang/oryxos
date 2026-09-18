@@ -13,6 +13,7 @@ import io.oryxos.core.skill.SkillLoader;
 import io.oryxos.core.skill.SkillRegistry;
 import io.oryxos.core.skill.SkillService;
 import io.oryxos.core.skill.SkillStore;
+import io.oryxos.core.testing.SymlinkAssumptions;
 import io.oryxos.web.GlobalExceptionHandler;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -40,6 +41,29 @@ class SkillApiControllerTest {
         MockMvcBuilders.standaloneSetup(new SkillApiController(service))
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
+  }
+
+  @Test
+  @DisplayName("readBoundedUtf8 超限即拒（流式上限，不再先全量缓冲）")
+  void readBoundedRejectsOversizedStream() throws Exception {
+    byte[] big = new byte[600 * 1024];
+    java.util.Arrays.fill(big, (byte) 'a');
+
+    IllegalArgumentException ex =
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                SkillApiController.readBoundedUtf8(
+                    new java.io.ByteArrayInputStream(big), 512L * 1024));
+    org.junit.jupiter.api.Assertions.assertTrue(ex.getMessage().contains("过大"));
+
+    // 上限内照常解码
+    String small =
+        SkillApiController.readBoundedUtf8(
+            new java.io.ByteArrayInputStream(
+                "内容".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+            1024);
+    org.junit.jupiter.api.Assertions.assertEquals("内容", small);
   }
 
   @Test
@@ -118,14 +142,13 @@ class SkillApiControllerTest {
   }
 
   @Test
-  @DisplayName("import 指向回环/内网/云元数据地址 → 400（SSRF 防护）")
-  void import_ssrf_blocked() throws Exception {
+  @DisplayName("import 非 GitHub tree URL → 400（含回环地址，先被 GitHub URL 规则拒绝）")
+  void import_nonGithubUrl_returns400() throws Exception {
     for (String url :
         new String[] {
           "http://127.0.0.1:8080/x/SKILL.md",
           "http://localhost/x/SKILL.md",
-          "http://169.254.169.254/latest/meta-data/",
-          "http://10.0.0.5/SKILL.md"
+          "http://example.com/SKILL.md"
         }) {
       mvc.perform(
               post("/api/v1/skills/import")
@@ -154,13 +177,16 @@ class SkillApiControllerTest {
         .andExpect(jsonPath("$.data.name").value("s1"))
         .andExpect(
             jsonPath("$.data.archivedPath")
-                .value(org.hamcrest.Matchers.startsWith("archive/skills/s1-")));
+                .value(
+                    org.hamcrest.Matchers.startsWith(
+                        Path.of("archive", "skills", "s1-").toString())));
     mvc.perform(get("/api/v1/skills/s1")).andExpect(status().isNotFound());
   }
 
   @Test
   @DisplayName("活跃或归档 Agent 引用阻止归档并返回结构化 409")
   void referencedSkillReturnsStructuredConflict() throws Exception {
+    SymlinkAssumptions.assumeSymlinksSupported(oryxosRoot);
     Path agent = Files.createDirectories(oryxosRoot.resolve("agents/ops"));
     Files.writeString(agent.resolve("AGENT.md"), "---\nname: ops\n---\nbody");
     SkillStore store = new SkillStore(oryxosRoot);

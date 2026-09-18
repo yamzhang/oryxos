@@ -1,5 +1,6 @@
 package io.oryxos.web.controller;
 
+import io.oryxos.core.policy.ResourceRef;
 import io.oryxos.core.skill.AgentSkillBindingService;
 import io.oryxos.core.skill.SkillCatalog;
 import io.oryxos.core.skill.SkillCatalogEntry;
@@ -13,8 +14,12 @@ import io.oryxos.web.controller.dto.SkillCatalogView;
 import io.oryxos.web.controller.dto.SkillView;
 import io.oryxos.web.controller.dto.UpdateSkillRequest;
 import io.oryxos.web.error.ResourceNotFoundException;
+import io.oryxos.web.security.AssetBindGuard;
 import io.oryxos.web.skill.GithubFolderFetcher;
+import jakarta.servlet.http.HttpServletRequest;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.IDN;
 import java.net.InetAddress;
@@ -49,7 +54,7 @@ import org.springframework.web.bind.annotation.RestController;
 @edu.umd.cs.findbugs.annotations.SuppressFBWarnings(
     value = {"SPRING_ENDPOINT", "EI_EXPOSE_REP2", "URLCONNECTION_SSRF_FD", "IMPROPER_UNICODE"},
     justification =
-        "core-stage web API is unauthenticated by design (internal network + gateway); auth is extension-phase. 协作者是 Spring 注入的共享单例，构造注入共享同一引用正是意图。/import 拉取运营者给定的 URL（等同安装插件），已做 SSRF 防护：限 http/https + 超时 + 大小上限 + 禁自动重定向、每跳校验目标主机非回环/内网/链路本地(含云元数据 169.254.169.254)/CGNAT。")
+        "core-stage web API is unauthenticated by design (internal network + gateway); auth is extension-phase. 协作者是 Spring 注入的共享单例，构造注入共享同一引用正是意图。/import 拉取运营者给定的 URL（等同安装插件），已做 SSRF 防护：限 http/https + 超时 + 大小上限 + 禁自动重定向、每跳校验目标主机非回环/内网/链路本地(含云元数据 169.254.169.254)/CGNAT/IPv6 ULA。")
 @RestController
 @RequestMapping("/api/v1/skills")
 public class SkillApiController {
@@ -65,9 +70,24 @@ public class SkillApiController {
   private static final String VISIBILITY_PUBLIC = "public";
   private static final String VISIBILITY_PRIVATE = "private";
 
+  /** IPv6 地址字节长度；IPv4-mapped / NAT64 展开前需先确认。 */
+  private static final int IPV6_ADDRESS_LENGTH = 16;
+
+  /** {@code ::ffff:0:0/96} 前缀中必须为 0 的前缀字节数（随后两字节为 0xff）。 */
+  private static final int IPV4_MAPPED_ZERO_PREFIX_LENGTH = 10;
+
+  private static final int EMBEDDED_IPV4_TAIL_OFFSET = 12;
+  private static final int SIXTOFOUR_IPV4_OFFSET = 2;
+  private static final int IPV4_OCTET_COUNT = 4;
+  private static final byte IPV6_LOOPBACK_SUFFIX = 1;
+
+  private static final byte[] NO_EMBEDDED_IPV4 = new byte[0];
+
   private final SkillService skills;
   private final SkillCatalog catalog;
   private final AgentSkillBindingService bindings;
+
+  private AssetBindGuard assetBindGuard;
 
   public SkillApiController(SkillService skills) {
     this(skills, null, null);
@@ -81,9 +101,21 @@ public class SkillApiController {
     this.bindings = bindings;
   }
 
+  @Autowired(required = false)
+  public void setAssetBindGuard(AssetBindGuard assetBindGuard) {
+    this.assetBindGuard = assetBindGuard;
+  }
+
   @GetMapping
-  public ApiResponse<List<SkillView>> list() {
-    return ApiResponse.ok(skills.list().stream().map(SkillView::from).toList());
+  public ApiResponse<List<SkillView>> list(HttpServletRequest request) {
+    return ApiResponse.ok(
+        skills.list().stream()
+            .filter(
+                s ->
+                    assetBindGuard == null
+                        || assetBindGuard.isVisible(request, ResourceRef.skill(s.name())))
+            .map(SkillView::from)
+            .toList());
   }
 
   @GetMapping("/{name}")
@@ -149,9 +181,9 @@ public class SkillApiController {
       guardPublicHost(uri); // 每跳都校验（防重定向绕过）
       HttpRequest request =
           HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(10)).GET().build();
-      HttpResponse<String> resp;
+      HttpResponse<InputStream> resp;
       try {
-        resp = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        resp = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
       } catch (IOException e) {
         throw new UncheckedIOException("拉取 URL 失败: " + uri, e);
       } catch (InterruptedException e) {
@@ -160,12 +192,14 @@ public class SkillApiController {
       }
       int status = resp.statusCode();
       if (status / 100 == 2) {
-        String body = resp.body();
-        if (body != null && body.length() > MAX_SKILL_BYTES) {
-          throw new IllegalArgumentException("SKILL.md 过大（>512KB），拒绝导入");
+        // 有界流式读：超限即断——ofString 会把整个 body 缓冲进内存，512KB 上限挡不住 GB 级响应的 OOM
+        try (InputStream in = resp.body()) {
+          return readBoundedUtf8(in, MAX_SKILL_BYTES);
+        } catch (IOException e) {
+          throw new UncheckedIOException("读取响应体失败: " + uri, e);
         }
-        return body;
       }
+      closeQuietly(resp.body()); // 3xx/错误路径不消费 body，主动关流释放连接
       if (status / 100 == 3) {
         String location = resp.headers().firstValue("location").orElse(null);
         if (location == null || location.isBlank()) {
@@ -179,14 +213,39 @@ public class SkillApiController {
     throw new IllegalArgumentException("重定向次数过多，拒绝导入");
   }
 
+  /** 有界读取响应体并按 UTF-8 解码：超过 maxBytes 即拒绝（不多占内存）；截断点落在多字节字符上会由解码器落替换符。包私有供单测。 */
+  static String readBoundedUtf8(InputStream in, long maxBytes) throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    byte[] buffer = new byte[8192];
+    long total = 0;
+    int n;
+    while ((n = in.read(buffer)) != -1) {
+      total += n;
+      if (total > maxBytes) {
+        throw new IllegalArgumentException("SKILL.md 过大（>512KB），拒绝导入");
+      }
+      out.write(buffer, 0, n);
+    }
+    return out.toString(StandardCharsets.UTF_8);
+  }
+
+  private static void closeQuietly(InputStream in) {
+    try {
+      in.close();
+    } catch (IOException ignored) {
+      // 释放连接的兜底路径，异常无意义
+    }
+  }
+
   /**
-   * SSRF 防护：拒绝主机解析到回环/任意本地/链路本地(含 169.254.169.254)/站点内网/组播/CGNAT，以及 localhost、*.internal、云元数据主机名。
+   * SSRF 防护：拒绝主机解析到回环/任意本地/链路本地(含 169.254.169.254)/站点内网/组播/CGNAT/IPv6 ULA （fc00::/7），以及
+   * localhost、*.internal、云元数据主机名。与工具层 {@code WhitelistSandbox} 内网口径对齐。
    */
   @edu.umd.cs.findbugs.annotations.SuppressFBWarnings(
       value = "IMPROPER_UNICODE",
       justification =
           "IDN.toASCII canonicalizes the complete DNS host before security checks; no substring is transformed independently.")
-  private static void guardPublicHost(URI uri) {
+  static void guardPublicHost(URI uri) {
     String host = uri.getHost();
     if (host == null || host.isBlank()) {
       throw new IllegalArgumentException("URL 缺少主机名: " + uri);
@@ -200,23 +259,160 @@ public class SkillApiController {
     if (isInternalName(asciiHost)) {
       throw new IllegalArgumentException("拒绝访问内网 / 元数据主机: " + host);
     }
+    // IPv6 字面量偶发带方括号；剥掉后再解析，ULA/回环判断才生效（与 WhitelistSandbox 一致）
+    String lookup =
+        asciiHost.startsWith("[") && asciiHost.endsWith("]")
+            ? asciiHost.substring(1, asciiHost.length() - 1)
+            : asciiHost;
     InetAddress[] addresses;
     try {
-      addresses = InetAddress.getAllByName(asciiHost);
+      addresses = InetAddress.getAllByName(lookup);
     } catch (UnknownHostException e) {
       throw new IllegalArgumentException("无法解析主机: " + host);
     }
     for (InetAddress addr : addresses) {
-      if (addr.isLoopbackAddress()
-          || addr.isAnyLocalAddress()
-          || addr.isLinkLocalAddress()
-          || addr.isSiteLocalAddress()
-          || addr.isMulticastAddress()
-          || isCarrierGradeNat(addr)) {
+      if (isBlockedSsrfAddress(addr)) {
         throw new IllegalArgumentException(
             "拒绝访问内网 / 保留地址: " + host + " → " + addr.getHostAddress());
       }
     }
+  }
+
+  /**
+   * IPv4-mapped / NAT64 / 6to4 / Teredo / ISATAP / IPv4-compatible 先展开嵌入 IPv4，再套用内网/元数据判定；与 {@code
+   * WhitelistSandbox} 读路径 SSRF 兜底对齐。
+   */
+  private static boolean isBlockedSsrfAddress(InetAddress addr) {
+    InetAddress effective = unwrapEmbeddedIpv4(addr);
+    return addr.isLoopbackAddress()
+        || addr.isAnyLocalAddress()
+        || effective.isLoopbackAddress()
+        || effective.isAnyLocalAddress()
+        || effective.isLinkLocalAddress()
+        || effective.isSiteLocalAddress()
+        || effective.isMulticastAddress()
+        || isCarrierGradeNat(effective)
+        || isIpv6UniqueLocal(addr);
+  }
+
+  private static InetAddress unwrapEmbeddedIpv4(InetAddress addr) {
+    byte[] b = addr.getAddress();
+    if (b.length != IPV6_ADDRESS_LENGTH) {
+      return addr;
+    }
+    byte[] ipv4 = extractEmbeddedIpv4(b);
+    if (ipv4.length == 0) {
+      return addr;
+    }
+    try {
+      return InetAddress.getByAddress(ipv4);
+    } catch (UnknownHostException e) {
+      return addr;
+    }
+  }
+
+  private static byte[] extractEmbeddedIpv4(byte[] b) {
+    if (isIpv4MappedPrefix(b) || isNat64WellKnownPrefix(b) || isIpv4CompatiblePrefix(b)) {
+      return new byte[] {
+        b[EMBEDDED_IPV4_TAIL_OFFSET],
+        b[EMBEDDED_IPV4_TAIL_OFFSET + 1],
+        b[EMBEDDED_IPV4_TAIL_OFFSET + 2],
+        b[EMBEDDED_IPV4_TAIL_OFFSET + 3]
+      };
+    }
+    if (isSixToFourPrefix(b)) {
+      return new byte[] {
+        b[SIXTOFOUR_IPV4_OFFSET],
+        b[SIXTOFOUR_IPV4_OFFSET + 1],
+        b[SIXTOFOUR_IPV4_OFFSET + 2],
+        b[SIXTOFOUR_IPV4_OFFSET + 3]
+      };
+    }
+    if (isTeredoPrefix(b)) {
+      return new byte[] {
+        (byte) (~b[EMBEDDED_IPV4_TAIL_OFFSET] & 0xFF),
+        (byte) (~b[EMBEDDED_IPV4_TAIL_OFFSET + 1] & 0xFF),
+        (byte) (~b[EMBEDDED_IPV4_TAIL_OFFSET + 2] & 0xFF),
+        (byte) (~b[EMBEDDED_IPV4_TAIL_OFFSET + 3] & 0xFF)
+      };
+    }
+    if (isIsatapInterfaceId(b)) {
+      return new byte[] {
+        b[EMBEDDED_IPV4_TAIL_OFFSET],
+        b[EMBEDDED_IPV4_TAIL_OFFSET + 1],
+        b[EMBEDDED_IPV4_TAIL_OFFSET + 2],
+        b[EMBEDDED_IPV4_TAIL_OFFSET + 3]
+      };
+    }
+    return NO_EMBEDDED_IPV4;
+  }
+
+  private static boolean isIpv4MappedPrefix(byte[] b) {
+    for (int i = 0; i < IPV4_MAPPED_ZERO_PREFIX_LENGTH; i++) {
+      if (b[i] != 0) {
+        return false;
+      }
+    }
+    return (b[10] & 0xFF) == 0xFF && (b[11] & 0xFF) == 0xFF;
+  }
+
+  private static boolean isNat64WellKnownPrefix(byte[] b) {
+    return (b[0] & 0xFF) == 0x00
+        && (b[1] & 0xFF) == 0x64
+        && (b[2] & 0xFF) == 0xFF
+        && (b[3] & 0xFF) == 0x9B
+        && b[4] == 0
+        && b[5] == 0
+        && b[6] == 0
+        && b[7] == 0
+        && b[8] == 0
+        && b[9] == 0
+        && b[10] == 0
+        && b[11] == 0;
+  }
+
+  private static boolean isSixToFourPrefix(byte[] b) {
+    return (b[0] & 0xFF) == 0x20 && (b[1] & 0xFF) == 0x02;
+  }
+
+  private static boolean isIpv4CompatiblePrefix(byte[] b) {
+    for (int i = 0; i < IPV4_MAPPED_ZERO_PREFIX_LENGTH; i++) {
+      if (b[i] != 0) {
+        return false;
+      }
+    }
+    if (b[IPV4_MAPPED_ZERO_PREFIX_LENGTH] != 0 || b[IPV4_MAPPED_ZERO_PREFIX_LENGTH + 1] != 0) {
+      return false;
+    }
+    return !isNativeIpv6UnspecifiedOrLoopbackTail(b);
+  }
+
+  private static boolean isNativeIpv6UnspecifiedOrLoopbackTail(byte[] b) {
+    int lastIndex = EMBEDDED_IPV4_TAIL_OFFSET + IPV4_OCTET_COUNT - 1;
+    for (int i = EMBEDDED_IPV4_TAIL_OFFSET; i < lastIndex; i++) {
+      if (b[i] != 0) {
+        return false;
+      }
+    }
+    byte last = b[lastIndex];
+    return last == 0 || last == IPV6_LOOPBACK_SUFFIX;
+  }
+
+  /** Teredo {@code 2001:0000::/32}（RFC 4380）。 */
+  private static boolean isTeredoPrefix(byte[] b) {
+    return (b[0] & 0xFF) == 0x20
+        && (b[1] & 0xFF) == 0x01
+        && (b[2] & 0xFF) == 0x00
+        && (b[3] & 0xFF) == 0x00;
+  }
+
+  /** ISATAP IID {@code 0000:5EFE} / {@code 0200:5EFE}（RFC 5214 §6.1）。 */
+  private static boolean isIsatapInterfaceId(byte[] b) {
+    int b8 = b[8] & 0xFF;
+    return (b8 == 0x00 || b8 == 0x02)
+        && b[9] == 0
+        && (b[10] & 0xFF) == 0x5E
+        && (b[11] & 0xFF) == 0xFE;
   }
 
   @edu.umd.cs.findbugs.annotations.SuppressFBWarnings(
@@ -237,6 +433,12 @@ public class SkillApiController {
   private static boolean isCarrierGradeNat(InetAddress addr) {
     byte[] b = addr.getAddress();
     return b.length == 4 && (b[0] & 0xFF) == 100 && (b[1] & 0xC0) == 0x40;
+  }
+
+  /** IPv6 ULA fc00::/7（唯一本地地址，isSiteLocalAddress 对 IPv6 不覆盖——否则 [fd00::1] 可绕过）。 */
+  private static boolean isIpv6UniqueLocal(InetAddress addr) {
+    byte[] b = addr.getAddress();
+    return b.length == IPV6_ADDRESS_LENGTH && (b[0] & 0xFE) == 0xFC;
   }
 
   @PutMapping("/{name}")

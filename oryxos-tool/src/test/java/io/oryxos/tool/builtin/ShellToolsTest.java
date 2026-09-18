@@ -3,9 +3,6 @@ package io.oryxos.tool.builtin;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
 
 import io.oryxos.tool.sandbox.FileSandboxProperties;
 import io.oryxos.tool.sandbox.HttpSandboxProperties;
@@ -14,27 +11,47 @@ import io.oryxos.tool.sandbox.Sandbox;
 import io.oryxos.tool.sandbox.SandboxViolationException;
 import io.oryxos.tool.sandbox.ShellSandboxProperties;
 import io.oryxos.tool.sandbox.WhitelistSandbox;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-/** 课件《第20节》验收 harness：ShellToolsTest——正常能跑通 + 越界会被拦 + 超时兜底。 */
+/** ShellTools 的回归测试：覆盖结构化 argv、Sandbox 拦截、退出码、超时与管道排空顺序。 */
 class ShellToolsTest {
 
-  private final ShellTools tools = new ShellTools(new PermissiveSandbox());
-
   @Test
-  @DisplayName("shell 正常执行拿到标准输出")
-  void shellReturnsStdout() {
-    assertEquals("oryx", tools.shell("echo -n oryx"));
+  @DisplayName("shell 将可执行文件与参数原样作为 argv 传给进程")
+  void shellPassesExecutableAndLiteralArgumentsToProcess() {
+    AtomicReference<List<String>> startedCommand = new AtomicReference<>();
+    ShellTools tools =
+        new ShellTools(
+            new PermissiveSandbox(),
+            Duration.ofSeconds(1),
+            command -> {
+              startedCommand.set(command);
+              return new StubProcess(true, "oryx", "", 0);
+            });
+
+    assertEquals("oryx", tools.shell("echo", List.of("-n", "oryx; pwd")));
+    assertEquals(List.of("echo", "-n", "oryx; pwd"), startedCommand.get());
   }
 
   @Test
   @DisplayName("非零退出码_失败带 stderr")
   void nonZeroExitFailsWithStderr() {
+    ShellTools tools = shellTools(new StubProcess(true, "", "boom", 3));
+
     IllegalStateException ex =
-        assertThrows(IllegalStateException.class, () -> tools.shell("echo boom >&2; exit 3"));
+        assertThrows(IllegalStateException.class, () -> tools.shell("echo", List.of("boom")));
 
     assertTrue(ex.getMessage().contains("3"));
     assertTrue(ex.getMessage().contains("boom"));
@@ -43,35 +60,302 @@ class ShellToolsTest {
   @Test
   @DisplayName("命令挂死_按超时终止并报失败")
   void hangingCommandIsKilledOnTimeout() {
-    ShellTools shortTimeout = new ShellTools(new PermissiveSandbox(), Duration.ofMillis(300));
+    StubProcess process = new StubProcess(false, "", "", 0);
+    ShellTools shortTimeout =
+        new ShellTools(new PermissiveSandbox(), Duration.ofMillis(300), command -> process);
 
     IllegalStateException ex =
-        assertThrows(IllegalStateException.class, () -> shortTimeout.shell("sleep 5"));
+        assertThrows(IllegalStateException.class, () -> shortTimeout.shell("sleep", List.of("5")));
 
     assertTrue(ex.getMessage().contains("超时"));
+    assertTrue(process.wasForciblyDestroyed());
+  }
+
+  @Test
+  @DisplayName("waitFor 前并发排空 stdout/stderr_否则大输出会假超时")
+  void drainsStdoutAndStderrBeforeWaitFor() {
+    // 模拟管道背压：进程在 stdout/stderr 被开始读取之前不能「结束」；
+    // 若实现先 waitFor 再读流，waitFor 会拖到超时。
+    DrainOrderProcess process = new DrainOrderProcess("big-output");
+    ShellTools tools =
+        new ShellTools(new PermissiveSandbox(), Duration.ofSeconds(2), command -> process);
+
+    assertEquals("big-output", tools.shell("echo", List.of("big-output")));
+    assertTrue(process.drainsStartedBeforeWaitForReturned());
   }
 
   @Test
   @DisplayName("越界会被拦：白名单拒绝时命令根本不跑")
   void sandboxRejectionBlocksCommand() {
-    Sandbox denying = mock(Sandbox.class);
-    doThrow(new SandboxViolationException("命令不在白名单")).when(denying).enforce(any());
+    Sandbox denying =
+        action -> {
+          throw new SandboxViolationException("命令不在白名单");
+        };
+    ShellTools tools =
+        new ShellTools(
+            denying,
+            Duration.ofSeconds(1),
+            command -> {
+              throw new AssertionError("Sandbox 拒绝后不能启动进程");
+            });
 
-    assertThrows(SandboxViolationException.class, () -> new ShellTools(denying).shell("echo hi"));
+    assertThrows(SandboxViolationException.class, () -> tools.shell("echo", List.of("hi")));
   }
 
   @Test
-  @DisplayName("白名单外命令_起进程前被拦")
-  void commandOutsideWhitelist_processNeverStarts() {
-    // 真 WhitelistSandbox（只允许 ls），跑 rm——若进程真起了会有副作用；抛 SandboxViolationException 证明起进程前被拦
+  @DisplayName("白名单外可执行文件_起进程前被拦")
+  void executableOutsideWhitelistProcessNeverStarts() {
     Sandbox whitelist =
         new WhitelistSandbox(
             new FileSandboxProperties(List.of()),
             new ShellSandboxProperties(List.of("ls")),
             new HttpSandboxProperties(List.of()));
+    ShellTools tools =
+        new ShellTools(
+            whitelist,
+            Duration.ofSeconds(1),
+            command -> {
+              throw new AssertionError("白名单外可执行文件不能启动进程");
+            });
 
     assertThrows(
         SandboxViolationException.class,
-        () -> new ShellTools(whitelist).shell("rm -rf /tmp/oryxos-should-never-run"));
+        () -> tools.shell("rm", List.of("-rf", "/tmp/oryxos-should-never-run")));
+  }
+
+  @Test
+  @DisplayName("按配置的 Charset 解码 stdout（GBK round-trip）")
+  void decodesStdoutWithConfiguredCharset() {
+    Charset gbk = Charset.forName("GBK");
+    String text = "你好世界";
+    ShellTools tools =
+        new ShellTools(
+            new PermissiveSandbox(),
+            Duration.ofSeconds(1),
+            command -> new StubProcess(true, text.getBytes(gbk), new byte[0], 0),
+            gbk);
+
+    assertEquals(text, tools.shell("echo", List.of(text)));
+  }
+
+  @Test
+  @DisplayName("非零退出码_stderr 同样按配置 Charset 解码")
+  void decodesStderrWithConfiguredCharset() {
+    Charset gbk = Charset.forName("GBK");
+    String errText = "失败原因";
+    ShellTools tools =
+        new ShellTools(
+            new PermissiveSandbox(),
+            Duration.ofSeconds(1),
+            command -> new StubProcess(true, new byte[0], errText.getBytes(gbk), 1),
+            gbk);
+
+    IllegalStateException ex =
+        assertThrows(IllegalStateException.class, () -> tools.shell("echo", List.of("x")));
+
+    assertTrue(ex.getMessage().contains(errText));
+  }
+
+  @Test
+  @DisplayName("stdout 超 64KB_截断并标注（白名单内命令可无界输出，防撑爆内存与上下文窗口）")
+  void stdoutOverLimitIsTruncated() {
+    byte[] big = new byte[ShellTools.MAX_OUTPUT_BYTES + 100];
+    java.util.Arrays.fill(big, (byte) 'a');
+    ShellTools tools =
+        new ShellTools(
+            new PermissiveSandbox(),
+            Duration.ofSeconds(1),
+            command -> new StubProcess(true, big, new byte[0], 0));
+
+    String result = tools.shell("echo", List.of("x"));
+
+    assertTrue(result.contains("已截断"));
+    assertTrue(result.length() < big.length, "截断后必须短于原始输出");
+  }
+
+  @Test
+  @DisplayName("非零退出码且 stderr 超限_截断后仍带标注")
+  void stderrOverLimitIsTruncatedOnFailure() {
+    byte[] big = new byte[ShellTools.MAX_OUTPUT_BYTES + 100];
+    java.util.Arrays.fill(big, (byte) 'e');
+    ShellTools tools =
+        new ShellTools(
+            new PermissiveSandbox(),
+            Duration.ofSeconds(1),
+            command -> new StubProcess(true, new byte[0], big, 1));
+
+    IllegalStateException ex =
+        assertThrows(IllegalStateException.class, () -> tools.shell("echo", List.of("x")));
+
+    assertTrue(ex.getMessage().contains("已截断"));
+  }
+
+  private static ShellTools shellTools(Process process) {
+    return new ShellTools(new PermissiveSandbox(), Duration.ofSeconds(1), command -> process);
+  }
+
+  /** 用最小进程替身隔离操作系统进程，断言 ShellTools 自己的参数与生命周期逻辑。 */
+  private static final class StubProcess extends Process {
+    private final boolean finished;
+    private final byte[] stdout;
+    private final byte[] stderr;
+    private final int exitCode;
+    private boolean forciblyDestroyed;
+
+    private StubProcess(boolean finished, String stdout, String stderr, int exitCode) {
+      this(
+          finished,
+          stdout.getBytes(StandardCharsets.UTF_8),
+          stderr.getBytes(StandardCharsets.UTF_8),
+          exitCode);
+    }
+
+    private StubProcess(boolean finished, byte[] stdout, byte[] stderr, int exitCode) {
+      this.finished = finished;
+      this.stdout = stdout;
+      this.stderr = stderr;
+      this.exitCode = exitCode;
+    }
+
+    @Override
+    public OutputStream getOutputStream() {
+      return OutputStream.nullOutputStream();
+    }
+
+    @Override
+    public InputStream getInputStream() {
+      return new ByteArrayInputStream(stdout);
+    }
+
+    @Override
+    public InputStream getErrorStream() {
+      return new ByteArrayInputStream(stderr);
+    }
+
+    @Override
+    public int waitFor() {
+      return exitCode;
+    }
+
+    @Override
+    public boolean waitFor(long timeout, TimeUnit unit) {
+      return finished;
+    }
+
+    @Override
+    public int exitValue() {
+      return exitCode;
+    }
+
+    @Override
+    public void destroy() {
+      forciblyDestroyed = true;
+    }
+
+    @Override
+    public Process destroyForcibly() {
+      forciblyDestroyed = true;
+      return this;
+    }
+
+    @Override
+    public java.util.stream.Stream<ProcessHandle> descendants() {
+      return java.util.stream.Stream.empty(); // 替身无真实 OS 进程，killTree 无子孙可杀
+    }
+
+    private boolean wasForciblyDestroyed() {
+      return forciblyDestroyed;
+    }
+  }
+
+  /** waitFor 仅在 stdout/stderr 都被开始读取后才返回 true——用来锁死「先排空再 waitFor」的顺序。 */
+  private static final class DrainOrderProcess extends Process {
+    private final byte[] stdout;
+    private final CountDownLatch drainsStarted = new CountDownLatch(2);
+    private volatile boolean waitForReturnedAfterDrains;
+
+    private DrainOrderProcess(String stdout) {
+      this.stdout = stdout.getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Override
+    public OutputStream getOutputStream() {
+      return OutputStream.nullOutputStream();
+    }
+
+    @Override
+    public InputStream getInputStream() {
+      return new SignalingInputStream(stdout, drainsStarted);
+    }
+
+    @Override
+    public InputStream getErrorStream() {
+      return new SignalingInputStream(new byte[0], drainsStarted);
+    }
+
+    @Override
+    public int waitFor() {
+      return 0;
+    }
+
+    @Override
+    public boolean waitFor(long timeout, TimeUnit unit) throws InterruptedException {
+      boolean ok = drainsStarted.await(timeout, unit);
+      waitForReturnedAfterDrains = ok;
+      return ok;
+    }
+
+    @Override
+    public int exitValue() {
+      return 0;
+    }
+
+    @Override
+    public void destroy() {}
+
+    @Override
+    public Process destroyForcibly() {
+      return this;
+    }
+
+    private boolean drainsStartedBeforeWaitForReturned() {
+      return waitForReturnedAfterDrains;
+    }
+  }
+
+  private static final class SignalingInputStream extends InputStream {
+    private final ByteArrayInputStream delegate;
+    private final CountDownLatch started;
+    private boolean signaled;
+
+    private SignalingInputStream(byte[] data, CountDownLatch started) {
+      this.delegate = new ByteArrayInputStream(data);
+      this.started = started;
+    }
+
+    private void signalOnce() {
+      if (!signaled) {
+        signaled = true;
+        started.countDown();
+      }
+    }
+
+    @Override
+    public int read() throws IOException {
+      signalOnce();
+      return delegate.read();
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+      signalOnce();
+      return delegate.read(b, off, len);
+    }
+
+    @Override
+    public byte[] readAllBytes() throws IOException {
+      signalOnce();
+      return delegate.readAllBytes();
+    }
   }
 }

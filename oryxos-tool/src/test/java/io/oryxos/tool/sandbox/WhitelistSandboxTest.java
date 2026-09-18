@@ -3,6 +3,7 @@ package io.oryxos.tool.sandbox;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import io.oryxos.core.testing.SymlinkAssumptions;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -67,6 +68,7 @@ class WhitelistSandboxTest {
     @Test
     @DisplayName("白名单内软连接指向外部时，读与不存在目标写均拒绝")
     void symlinkEscapeIsBlocked(@TempDir Path allowed) throws IOException {
+      SymlinkAssumptions.assumeSymlinksSupported(allowed);
       Path outside = Files.createTempDirectory("oryxos-sandbox-outside-");
       Files.writeString(outside.resolve("secret.txt"), "secret");
       Files.createSymbolicLink(allowed.resolve("escape"), outside);
@@ -89,6 +91,7 @@ class WhitelistSandboxTest {
     @Test
     @DisplayName("合法 Agent Skill 软连接指向同一白名单根时可读")
     void controlledSkillSymlinkIsAllowed(@TempDir Path allowed) throws IOException {
+      SymlinkAssumptions.assumeSymlinksSupported(allowed);
       Path shared = allowed.resolve("skills/report");
       Path local = allowed.resolve("agents/ops/skills");
       Files.createDirectories(shared);
@@ -129,6 +132,7 @@ class WhitelistSandboxTest {
     @Test
     @DisplayName("白名单按真实最小根判断，链接的 lexical 位置不能扩大授权")
     void symlinkUsesRealTargetRoot(@TempDir Path workspace) throws IOException {
+      SymlinkAssumptions.assumeSymlinksSupported(workspace);
       Path shared = Files.createDirectories(workspace.resolve("skills/report"));
       Path local = Files.createDirectories(workspace.resolve("agents/ops/skills"));
       Files.writeString(shared.resolve("SKILL.md"), "body");
@@ -151,14 +155,17 @@ class WhitelistSandboxTest {
     private final WhitelistSandbox sb = sandbox(List.of(), List.of("ls", "cat", "echo"), List.of());
 
     @Test
-    @DisplayName("白名单内命令_首token放行")
-    void firstTokenInWhitelistAllowed() {
-      assertDoesNotThrow(() -> sb.enforce(new SandboxAction(ActionType.SHELL_COMMAND, "ls -la")));
-      // 引号/转义不追加执行：允许
-      assertDoesNotThrow(
-          () -> sb.enforce(new SandboxAction(ActionType.SHELL_COMMAND, "echo \"a;b\"")));
-      assertDoesNotThrow(
-          () -> sb.enforce(new SandboxAction(ActionType.SHELL_COMMAND, "echo 'a;b'")));
+    @DisplayName("白名单内可执行文件_放行")
+    void executableInWhitelistAllowed() {
+      assertDoesNotThrow(() -> sb.enforce(new SandboxAction(ActionType.SHELL_COMMAND, "ls")));
+    }
+
+    @Test
+    @DisplayName("Shell 控制语法不能作为可执行文件绕过白名单")
+    void shellSyntaxCannotBypassExecutableWhitelist() {
+      assertThrows(
+          SandboxViolationException.class,
+          () -> sb.enforce(new SandboxAction(ActionType.SHELL_COMMAND, "ls -la; pwd")));
     }
 
     @Test
@@ -170,33 +177,16 @@ class WhitelistSandboxTest {
     }
 
     @Test
-    @DisplayName("命令注入绕过_分隔符/替换符/重定向一律拒绝")
-    void shellInjectionBlocked() {
-      // 首 token 全在白名单内，但元字符可追加/替换执行——必须拒绝
-      String[] injections = {
-        "ls && cat /etc/passwd",
-        "ls ; cat /etc/passwd",
-        "ls | cat /etc/passwd",
-        "cat /etc/passwd > /tmp/x",
-        "echo $(cat /etc/passwd)",
-        "echo `cat /etc/passwd`",
-        "ls && { rm -rf / ; }",
-        "ls\ncat /etc/passwd"
-      };
-      for (String injection : injections) {
-        assertThrows(
-            SandboxViolationException.class,
-            () -> sb.enforce(new SandboxAction(ActionType.SHELL_COMMAND, injection)),
-            "应拒绝注入命令: " + injection);
-      }
-    }
+    @DisplayName("管理员显式配置的解释器可被 Shell 白名单允许")
+    void explicitlyAllowlistedInterpretersAreAllowed() {
+      for (String interpreter : List.of("bash", "sh", "cmd.exe", "powershell", "python3", "node")) {
+        WhitelistSandbox interpreterSandbox = sandbox(List.of(), List.of(interpreter), List.of());
 
-    @Test
-    @DisplayName("未闭合引号_视为不合法命令拒绝")
-    void unterminatedQuoteRejected() {
-      assertThrows(
-          SandboxViolationException.class,
-          () -> sb.enforce(new SandboxAction(ActionType.SHELL_COMMAND, "echo \"unterminated")));
+        assertDoesNotThrow(
+            () ->
+                interpreterSandbox.enforce(
+                    new SandboxAction(ActionType.SHELL_COMMAND, interpreter)));
+      }
     }
   }
 
@@ -244,6 +234,23 @@ class WhitelistSandboxTest {
           SandboxViolationException.class,
           () -> sb.enforce(new SandboxAction(ActionType.HTTP_REQUEST, "not-a-url")));
     }
+
+    @Test
+    @DisplayName("非 http(s) 即使 host 在白名单也拒绝")
+    void nonHttpSchemeRejectedEvenIfHostAllowlisted() {
+      for (String url :
+          new String[] {
+            "ftp://api.deepseek.com/x",
+            "file://api.deepseek.com/etc/passwd",
+            "ws://api.deepseek.com/socket",
+            "data:text/plain,hi"
+          }) {
+        assertThrows(
+            SandboxViolationException.class,
+            () -> sb.enforce(new SandboxAction(ActionType.HTTP_REQUEST, url)),
+            () -> url);
+      }
+    }
   }
 
   @Nested
@@ -261,10 +268,29 @@ class WhitelistSandboxTest {
     }
 
     @Test
-    @DisplayName("无主机的伪目标（web_search）放行")
-    void hostlessReadAllowed() {
+    @DisplayName("web_search 伪目标放行")
+    void webSearchPseudoTargetAllowed() {
       assertDoesNotThrow(
           () -> sb.enforce(new SandboxAction(ActionType.HTTP_READ, "web_search:foo")));
+    }
+
+    @Test
+    @DisplayName("非 http(s) 或无主机名拒绝（不再把 host==null 一律放行）")
+    void nonHttpOrHostlessReadBlocked() {
+      for (String url :
+          new String[] {
+            "file:///etc/passwd",
+            "file:///C:/Windows/win.ini",
+            "data:text/plain,hi",
+            "ftp://example.com/x",
+            "http:///no-host",
+            "https:"
+          }) {
+        assertThrows(
+            SandboxViolationException.class,
+            () -> sb.enforce(new SandboxAction(ActionType.HTTP_READ, url)),
+            () -> url);
+      }
     }
 
     @Test
@@ -278,12 +304,51 @@ class WhitelistSandboxTest {
             "http://169.254.1.1/x",
             "http://[::1]/x", // IPv6 回环
             "http://[fd00::1]/x", // IPv6 ULA fc00::/7
+            "http://[::ffff:169.254.169.254]/x", // IPv4-mapped 云元数据
+            "http://[64:ff9b::a9fe:a9fe]/x", // NAT64 well-known → 169.254.169.254
+            "http://[64:ff9b::100.64.1.1]/x", // NAT64 → CGNAT
+            "http://[2002:a9fe:a9fe::1]/x", // 6to4 → 169.254.169.254
+            "http://[::a9fe:a9fe]/x", // IPv4-compatible → 169.254.169.254
+            "http://[2001::5601:5601]/x", // Teredo → 169.254.169.254
+            "http://[2001:db8::5efe:a9fe:a9fe]/x", // ISATAP → 169.254.169.254
+            "http://[2001:db8::200:5efe:a9fe:a9fe]/x", // ISATAP u-bit → 169.254.169.254
             "http://localhost/x"
           }) {
         assertThrows(
             SandboxViolationException.class,
-            () -> sb.enforce(new SandboxAction(ActionType.HTTP_READ, url)));
+            () -> sb.enforce(new SandboxAction(ActionType.HTTP_READ, url)),
+            () -> "should block: " + url);
       }
+    }
+
+    @Test
+    @DisplayName("NAT64 / 6to4 嵌入公网 IPv4 仍放行")
+    void embeddedPublicIpv4Allowed() {
+      assertDoesNotThrow(
+          () -> sb.enforce(new SandboxAction(ActionType.HTTP_READ, "http://[64:ff9b::8.8.8.8]/x")));
+      assertDoesNotThrow(
+          () -> sb.enforce(new SandboxAction(ActionType.HTTP_READ, "http://[2002:808:808::1]/x")));
+    }
+
+    @Test
+    @DisplayName("Teredo 嵌入公网 IPv4 仍放行")
+    void teredoPublicIpv4Allowed() {
+      assertDoesNotThrow(
+          () -> sb.enforce(new SandboxAction(ActionType.HTTP_READ, "http://[2001::f7f7:f7f7]/x")));
+    }
+
+    @Test
+    @DisplayName("ISATAP 嵌入公网 IPv4 仍放行")
+    void isatapPublicIpv4Allowed() {
+      assertDoesNotThrow(
+          () ->
+              sb.enforce(
+                  new SandboxAction(ActionType.HTTP_READ, "http://[2001:db8::5efe:808:808]/x")));
+      assertDoesNotThrow(
+          () ->
+              sb.enforce(
+                  new SandboxAction(
+                      ActionType.HTTP_READ, "http://[2001:db8::200:5efe:808:808]/x")));
     }
   }
 

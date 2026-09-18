@@ -3,6 +3,7 @@ package io.oryxos.web.controller;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -11,13 +12,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import io.oryxos.core.auth.Role;
+import io.oryxos.storage.AuthEventRecorder;
 import io.oryxos.storage.WebSession;
 import io.oryxos.storage.WebSessionService;
 import io.oryxos.storage.WebUserService;
 import io.oryxos.web.GlobalExceptionHandler;
 import io.oryxos.web.config.WebAuthProperties;
+import io.oryxos.web.security.LoginAttemptService;
 import java.time.Instant;
 import java.util.Optional;
+import java.util.Set;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -44,7 +49,12 @@ class AuthApiControllerTest {
     properties.setEnabled(true);
     mvc =
         MockMvcBuilders.standaloneSetup(
-                new AuthApiController(userService, sessionService, properties))
+                new AuthApiController(
+                    userService,
+                    sessionService,
+                    properties,
+                    new LoginAttemptService(),
+                    mock(AuthEventRecorder.class)))
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
   }
@@ -112,6 +122,52 @@ class AuthApiControllerTest {
   }
 
   @Test
+  @DisplayName("login_带旧cookie重新登录_旧session被废新session生效")
+  void login_withStaleCookie_deletesOldSession() throws Exception {
+    when(userService.verify("admin", "s3cret-pw")).thenReturn(true);
+    when(sessionService.create("admin")).thenReturn(newSession("admin", "sid-new"));
+
+    mvc.perform(
+            post("/api/v1/auth/login")
+                .cookie(new jakarta.servlet.http.Cookie("oryxos_session", "sid-old"))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"admin\",\"password\":\"s3cret-pw\"}"))
+        .andExpect(status().isOk())
+        .andExpect(
+            header()
+                .string(
+                    "Set-Cookie", org.hamcrest.Matchers.containsString("oryxos_session=sid-new")));
+    verify(sessionService).delete("sid-old"); // 旧 session 废掉，不留孤儿行也不给旧 id 续命
+  }
+
+  @Test
+  @DisplayName("login_反代带X-Forwarded-Proto=https_ForwardedHeaderFilter下Set-Cookie含Secure")
+  void login_behindProxy_forwardedProtoYieldsSecureCookie() throws Exception {
+    when(userService.verify("admin", "s3cret-pw")).thenReturn(true);
+    when(sessionService.create("admin")).thenReturn(newSession("admin", "sid-123"));
+    // 镜像 server.forward-headers-strategy=framework 的装配：该策略就是注册 ForwardedHeaderFilte
+    MockMvc proxiedMvc =
+        MockMvcBuilders.standaloneSetup(
+                new AuthApiController(
+                    userService,
+                    sessionService,
+                    properties,
+                    new LoginAttemptService(),
+                    mock(AuthEventRecorder.class)))
+            .addFilters(new org.springframework.web.filter.ForwardedHeaderFilter())
+            .build();
+
+    proxiedMvc
+        .perform(
+            post("/api/v1/auth/login")
+                .header("X-Forwarded-Proto", "https")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"admin\",\"password\":\"s3cret-pw\"}"))
+        .andExpect(status().isOk())
+        .andExpect(header().string("Set-Cookie", org.hamcrest.Matchers.containsString("Secure")));
+  }
+
+  @Test
   @DisplayName("login_缺字段_400")
   void login_missingFields_400() throws Exception {
     mvc.perform(
@@ -160,6 +216,7 @@ class AuthApiControllerTest {
   void me_validSession_200() throws Exception {
     when(sessionService.findValid("sid-123"))
         .thenReturn(Optional.of(newSession("admin", "sid-123")));
+    when(userService.rolesOf("admin")).thenReturn(Set.of(Role.EDITOR));
 
     mvc.perform(
             get("/api/v1/auth/me")
@@ -167,7 +224,9 @@ class AuthApiControllerTest {
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.code").value(0))
         .andExpect(jsonPath("$.data.authenticationEnabled").value(true))
-        .andExpect(jsonPath("$.data.username").value("admin"));
+        .andExpect(jsonPath("$.data.username").value("admin"))
+        .andExpect(jsonPath("$.data.roles[0]").value("EDITOR"));
+    verify(userService).rolesOf("admin");
   }
 
   @Test
@@ -188,6 +247,55 @@ class AuthApiControllerTest {
                 .cookie(new jakarta.servlet.http.Cookie("oryxos_session", "sid-123")))
         .andExpect(status().isUnauthorized())
         .andExpect(jsonPath("$.code").value(401));
+  }
+
+  @Test
+  @DisplayName("login_轮换X-Forwarded-For不能绕过锁定")
+  void login_spoofedXForwardedFor_doesNotBypassLockout() throws Exception {
+    when(userService.verify("admin", "wrong")).thenReturn(false);
+    LoginAttemptService attempts = new LoginAttemptService();
+    MockMvc proxiedMvc =
+        MockMvcBuilders.standaloneSetup(
+                new AuthApiController(
+                    userService,
+                    sessionService,
+                    properties,
+                    attempts,
+                    mock(AuthEventRecorder.class)))
+            .addFilters(new org.springframework.web.filter.ForwardedHeaderFilter())
+            .setControllerAdvice(new GlobalExceptionHandler())
+            .build();
+
+    for (int i = 0; i < 5; i++) {
+      proxiedMvc
+          .perform(
+              post("/api/v1/auth/login")
+                  .header("X-Forwarded-For", "1.1.1." + i)
+                  .with(
+                      request -> {
+                        request.setRemoteAddr("127.0.0.1");
+                        return request;
+                      })
+                  .contentType(MediaType.APPLICATION_JSON)
+                  .content("{\"username\":\"admin\",\"password\":\"wrong\"}"))
+          .andExpect(status().isUnauthorized());
+    }
+
+    proxiedMvc
+        .perform(
+            post("/api/v1/auth/login")
+                .header("X-Forwarded-For", "9.9.9.9")
+                .with(
+                    request -> {
+                      request.setRemoteAddr("127.0.0.1");
+                      return request;
+                    })
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"admin\",\"password\":\"wrong\"}"))
+        .andExpect(status().isTooManyRequests())
+        .andExpect(jsonPath("$.code").value(429));
+
+    verify(userService, times(5)).verify("admin", "wrong");
   }
 
   private static WebSession newSession(String username, String sessionId) {

@@ -8,9 +8,10 @@ on:
     types: [closed]
     branches: [main]
 
-# 创建 Release + tag 需要写 contents 权限
+# 创建 Release + tag 需要写 contents 权限；推镜像到 GHCR 需要写 packages 权限
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release-${{ github.event.pull_request.number }}
@@ -24,15 +25,16 @@ jobs:
       github.event.pull_request.merged == true &&
       startsWith(github.event.pull_request.title, 'release:')
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Checkout main (含已合入代码)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -41,8 +43,11 @@ jobs:
       - name: Resolve version from pom.xml
         id: ver
         run: |
-          RAW=$(awk '/<artifactId>oryxos<\/artifactId>/{f=1} f&&/<version>/{gsub(/.*<version>|<\/version>.*/,"");gsub(/[[:space:]]/,"");print;exit}' pom.xml)
-          if [ -z "$RAW" ]; then echo "::error::无法从 pom.xml 解析版本号"; exit 1; fi
+          RAW=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
+          if [ -z "$RAW" ] || [ "$RAW" = "null object or invalid expression" ]; then
+            echo "::error::无法从 pom.xml 解析版本号"
+            exit 1
+          fi
           # 剥离开发用 -SNAPSHOT 后缀；-RELEASE 等正式标签原样保留
           VERSION="${RAW%-SNAPSHOT}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -80,3 +85,44 @@ jobs:
               --generate-notes
           fi
           echo "已发布 $TAG，产物：$(basename "$TARBALL")"
+
+      # ── 容器镜像（纯增量）：tar.gz 之后的第二种产物，推到 GHCR ──
+      # jar 平台无关（镜像内不跑 Maven）：amd64 runner 原生构建 jar 一次，
+      # buildx 双架构只是各自拉基础镜像 + COPY jar，无需 QEMU 跑 Maven。
+      # 顺序刻意放在 tar.gz Release 之后：镜像失败不阻塞既有的 tar.gz 发版。
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build & push multi-arch image
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/oryxos
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag "${IMAGE}:v${VERSION}" \
+            --tag "${IMAGE}:latest" \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --push \
+            .
+          echo "已推送 ${IMAGE}:v${VERSION} 与 :latest（linux/amd64 + linux/arm64）"
+
+      # ── 039：Helm chart 第三种产物——打包 tgz 追加到同一 Release 附件（appVersion 对齐 pom 版本）。
+      # 顺序放在镜像之后：chart 失败不阻塞 tar.gz 与镜像发版；不做 OCI chart 仓库（YAGNI，R8）。
+      - name: Package & upload Helm chart
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          bash scripts/install-k8s-tools.sh gate
+          export PATH="$HOME/bin:$PATH"
+          helm package charts/oryxos --app-version "${VERSION}-RELEASE" -d dist/
+          gh release upload "v${VERSION}" dist/oryxos-*.tgz --clobber
+          echo "已上传 chart 附件到 Release v${VERSION}"

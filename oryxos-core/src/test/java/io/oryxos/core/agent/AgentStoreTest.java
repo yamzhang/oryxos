@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.oryxos.core.testing.SymlinkAssumptions;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -84,6 +85,7 @@ class AgentStoreTest {
   @Test
   @DisplayName("write/writeAll 拒绝经父链接逃逸及占用 skills 保留命名空间")
   void writesRejectSymlinkEscapeAndReservedSkills() throws IOException {
+    SymlinkAssumptions.assumeSymlinksSupported(oryxosRoot);
     Path outside = Files.createDirectories(oryxosRoot.resolveSibling("agent-store-outside"));
     Path agent = Files.createDirectories(oryxosRoot.resolve("agents/demo"));
     Files.createSymbolicLink(agent.resolve("escape"), outside);
@@ -105,6 +107,17 @@ class AgentStoreTest {
   }
 
   @Test
+  @DisplayName("write/writeAll 拒绝占用 knowledge 保留命名空间（与 skills/ 同口径）")
+  void writesRejectReservedKnowledgeNamespace() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> store.writeAll("demo", Map.of("knowledge/ops.md", "copy")));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> store.writeAll("demo", Map.of("knowledge/ops/README.md", "copy")));
+  }
+
+  @Test
   @DisplayName("writeAll 全量预校验失败时已存在文件保持原样")
   void writeAllValidationFailureIsAtomic() throws IOException {
     Path agent = store.write("demo", "old");
@@ -117,5 +130,13 @@ class AgentStoreTest {
 
     assertEquals("old", Files.readString(agent.resolve("AGENT.md")));
     assertTrue(Files.isDirectory(agent.resolve("collision")));
+  }
+
+  @Test
+  @DisplayName("writeAll 拒绝 Skills/ 大小写变体占用绑定命名空间")
+  void writeAllRejectsSkillsNamespaceIgnoringCase() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> store.writeAll("demo", Map.of("Skills/report/SKILL.md", "copy")));
   }
 }

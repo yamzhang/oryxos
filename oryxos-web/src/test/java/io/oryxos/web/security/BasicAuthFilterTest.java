@@ -1,9 +1,12 @@
 package io.oryxos.web.security;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
@@ -11,12 +14,18 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.oryxos.core.auth.Principal;
+import io.oryxos.core.auth.Role;
+import io.oryxos.core.policy.AuthorizationService;
 import io.oryxos.storage.WebSession;
 import io.oryxos.storage.WebSessionService;
 import io.oryxos.storage.WebUserService;
 import io.oryxos.web.config.WebAuthProperties;
+import jakarta.servlet.http.HttpServletRequest;
 import java.time.Instant;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -37,15 +46,23 @@ class BasicAuthFilterTest {
   private WebUserService userService;
   private WebSessionService sessionService;
   private WebAuthProperties properties;
+  private LoginAttemptService loginAttemptService;
+  private AuthorizationService authorizationService;
   private MockMvc mvc;
+  private final AtomicReference<Principal> capturedPrincipal = new AtomicReference<>();
 
   @Controller
-  static class StubController {
+  class StubController {
     @GetMapping("/admin/")
-    public void adminRoot() {}
+    public void adminRoot(HttpServletRequest request) {
+      capturedPrincipal.set(PrincipalHolder.get(request));
+    }
 
     @GetMapping("/admin/login")
     public void adminLogin() {}
+
+    @GetMapping("/admin/assets/index-test.js")
+    public void adminAsset() {}
   }
 
   @BeforeEach
@@ -53,8 +70,12 @@ class BasicAuthFilterTest {
     userService = mock(WebUserService.class);
     sessionService = mock(WebSessionService.class);
     properties = new WebAuthProperties();
+    loginAttemptService = new LoginAttemptService();
+    authorizationService = mock(AuthorizationService.class);
+    capturedPrincipal.set(null);
     BasicAuthFilter filter =
-        new BasicAuthFilter(userService, sessionService, properties, new ObjectMapper());
+        new BasicAuthFilter(
+            userService, sessionService, properties, new ObjectMapper(), loginAttemptService);
     mvc = MockMvcBuilders.standaloneSetup(new StubController()).addFilter(filter).build();
   }
 
@@ -110,6 +131,85 @@ class BasicAuthFilterTest {
   }
 
   @Test
+  @DisplayName("enabled=true_Basic连续失败达上限后_429且不再验密")
+  void enabledBasic_lockoutBlocksFurtherVerify() throws Exception {
+    properties.setEnabled(true);
+    when(userService.verify("admin", "wrong")).thenReturn(false);
+
+    for (int i = 0; i < LoginAttemptService.MAX_FAILURES; i++) {
+      mvc.perform(
+              get("/admin/")
+                  .accept(MediaType.APPLICATION_JSON)
+                  .with(
+                      request -> {
+                        request.setRemoteAddr("127.0.0.1");
+                        return request;
+                      })
+                  .header("Authorization", basic("admin", "wrong")))
+          .andExpect(status().isUnauthorized());
+    }
+
+    mvc.perform(
+            get("/admin/")
+                .accept(MediaType.APPLICATION_JSON)
+                .with(
+                    request -> {
+                      request.setRemoteAddr("127.0.0.1");
+                      return request;
+                    })
+                .header("Authorization", basic("admin", "wrong")))
+        .andExpect(status().isTooManyRequests())
+        .andExpect(jsonPath("$.code").value(429));
+
+    // MAX_FAILURES 次验密后锁定；第 MAX_FAILURES+1 次不得再碰 verify
+    verify(userService, times(LoginAttemptService.MAX_FAILURES)).verify("admin", "wrong");
+  }
+
+  @Test
+  @DisplayName("enabled=true_表单路径累计失败后_Basic同样429")
+  void formLockout_alsoBlocksBasic() throws Exception {
+    properties.setEnabled(true);
+    String key = "admin|10.0.0.2";
+    for (int i = 0; i < LoginAttemptService.MAX_FAILURES; i++) {
+      loginAttemptService.onFailure(key);
+    }
+
+    mvc.perform(
+            get("/admin/")
+                .accept(MediaType.APPLICATION_JSON)
+                .with(
+                    request -> {
+                      request.setRemoteAddr("10.0.0.2");
+                      return request;
+                    })
+                .header("Authorization", basic("admin", "anything")))
+        .andExpect(status().isTooManyRequests());
+
+    verify(userService, never()).verify(anyString(), anyString());
+  }
+
+  @Test
+  @DisplayName("enabled=true_正确Basic凭据_清零失败计数")
+  void enabledCorrectBasic_clearsFailures() throws Exception {
+    properties.setEnabled(true);
+    when(userService.verify("admin", "s3cret-pw")).thenReturn(true);
+    loginAttemptService.onFailure("admin|127.0.0.1");
+    loginAttemptService.onFailure("admin|127.0.0.1");
+
+    mvc.perform(
+            get("/admin/")
+                .with(
+                    request -> {
+                      request.setRemoteAddr("127.0.0.1");
+                      return request;
+                    })
+                .header("Authorization", basic("admin", "s3cret-pw")))
+        .andExpect(status().isOk());
+
+    assertThat(loginAttemptService.isBlocked("admin|127.0.0.1")).isFalse();
+  }
+
+  @Test
   @DisplayName("enabled=true_有效session_cookie_200")
   void enabledValidSession_200() throws Exception {
     properties.setEnabled(true);
@@ -155,6 +255,14 @@ class BasicAuthFilterTest {
   }
 
   @Test
+  @DisplayName("/admin/assets/**_未登录放行（登录页渲染依赖SPA静态资源，018走查修复）")
+  void assetPath_passesThrough() throws Exception {
+    properties.setEnabled(true);
+    mvc.perform(get("/admin/assets/index-test.js")).andExpect(status().isOk());
+    verify(userService, never()).verify(anyString(), anyString());
+  }
+
+  @Test
   @DisplayName("非Basic头_401")
   void nonBasicHeader_401() throws Exception {
     properties.setEnabled(true);
@@ -183,6 +291,101 @@ class BasicAuthFilterTest {
     properties.setRealm("MySystem");
     mvc.perform(get("/admin/").accept(MediaType.APPLICATION_JSON))
         .andExpect(header().string("WWW-Authenticate", "Basic realm=\"MySystem\""));
+  }
+
+  @Test
+  @DisplayName("enabled=true_轮换X-Forwarded-For不能绕过Basic锁定")
+  void spoofedXForwardedFor_doesNotBypassLockout() throws Exception {
+    properties.setEnabled(true);
+    when(userService.verify("admin", "wrong")).thenReturn(false);
+    MockMvc proxied =
+        MockMvcBuilders.standaloneSetup(new StubController())
+            .addFilters(
+                new org.springframework.web.filter.ForwardedHeaderFilter(),
+                new BasicAuthFilter(
+                    userService,
+                    sessionService,
+                    properties,
+                    new ObjectMapper(),
+                    loginAttemptService))
+            .build();
+
+    for (int i = 0; i < LoginAttemptService.MAX_FAILURES; i++) {
+      String spoof = "1.1.1." + i;
+      proxied
+          .perform(
+              get("/admin/")
+                  .accept(MediaType.APPLICATION_JSON)
+                  .header("X-Forwarded-For", spoof)
+                  .with(
+                      request -> {
+                        request.setRemoteAddr("127.0.0.1");
+                        return request;
+                      })
+                  .header("Authorization", basic("admin", "wrong")))
+          .andExpect(status().isUnauthorized());
+    }
+
+    proxied
+        .perform(
+            get("/admin/")
+                .accept(MediaType.APPLICATION_JSON)
+                .header("X-Forwarded-For", "9.9.9.9")
+                .with(
+                    request -> {
+                      request.setRemoteAddr("127.0.0.1");
+                      return request;
+                    })
+                .header("Authorization", basic("admin", "wrong")))
+        .andExpect(status().isTooManyRequests())
+        .andExpect(jsonPath("$.code").value(429));
+
+    verify(userService, times(LoginAttemptService.MAX_FAILURES)).verify("admin", "wrong");
+  }
+
+  @Test
+  @DisplayName("Basic成功_置Principal且不调用AuthorizationService")
+  void basicSuccess_setsPrincipalWithoutDecide() throws Exception {
+    properties.setEnabled(true);
+    when(userService.verify("admin", "s3cret-pw")).thenReturn(true);
+    when(userService.rolesOf("admin")).thenReturn(Set.of(Role.EDITOR));
+
+    mvc.perform(get("/admin/").header("Authorization", basic("admin", "s3cret-pw")))
+        .andExpect(status().isOk());
+
+    Principal principal = capturedPrincipal.get();
+    assertThat(principal).isNotNull();
+    assertThat(principal.id()).isEqualTo("admin");
+    assertThat(principal.kind()).isEqualTo(Principal.Kind.USER);
+    assertThat(principal.roles()).containsExactly(Role.EDITOR);
+    verify(userService).rolesOf("admin");
+    verifyNoInteractions(authorizationService);
+  }
+
+  @Test
+  @DisplayName("session成功_置Principal且不调用AuthorizationService")
+  void sessionSuccess_setsPrincipalWithoutDecide() throws Exception {
+    properties.setEnabled(true);
+    when(sessionService.findValid("sid-123")).thenReturn(Optional.of(newSession("admin")));
+    when(userService.rolesOf("admin")).thenReturn(Set.of(Role.VIEWER));
+
+    mvc.perform(get("/admin/").cookie(new jakarta.servlet.http.Cookie("oryxos_session", "sid-123")))
+        .andExpect(status().isOk());
+
+    Principal principal = capturedPrincipal.get();
+    assertThat(principal).isNotNull();
+    assertThat(principal.id()).isEqualTo("admin");
+    assertThat(principal.roles()).containsExactly(Role.VIEWER);
+    verifyNoInteractions(authorizationService);
+  }
+
+  @Test
+  @DisplayName("auth关闭_不置主体")
+  void authOff_doesNotAttachPrincipal() throws Exception {
+    properties.setEnabled(false);
+    mvc.perform(get("/admin/")).andExpect(status().isOk());
+    assertThat(capturedPrincipal.get().isAnonymous()).isTrue();
+    verify(userService, never()).rolesOf(anyString());
   }
 
   private static String basic(String user, String pass) {

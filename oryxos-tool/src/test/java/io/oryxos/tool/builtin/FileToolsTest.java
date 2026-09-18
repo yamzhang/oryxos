@@ -8,6 +8,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 
+import io.oryxos.tool.sandbox.ActionType;
 import io.oryxos.tool.sandbox.FileSandboxProperties;
 import io.oryxos.tool.sandbox.HttpSandboxProperties;
 import io.oryxos.tool.sandbox.PermissiveSandbox;
@@ -16,9 +17,12 @@ import io.oryxos.tool.sandbox.SandboxViolationException;
 import io.oryxos.tool.sandbox.ShellSandboxProperties;
 import io.oryxos.tool.sandbox.WhitelistSandbox;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -55,9 +59,110 @@ class FileToolsTest {
   }
 
   @Test
+  @DisplayName("copy_file / move_file 拒绝真实目录（避免假成功空目录）")
+  void copyAndMoveRejectRealDirectories() throws IOException {
+    Path srcDir = dir.resolve("srcdir");
+    Files.createDirectories(srcDir);
+    Files.writeString(srcDir.resolve("keep.txt"), "data");
+    Path copyDest = dir.resolve("copied-dir");
+    Path moveDest = dir.resolve("moved-dir");
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.copyFile(srcDir.toString(), copyDest.toString()));
+    assertFalse(Files.exists(copyDest), "拒绝对目录复制后不得留下空目录");
+    assertTrue(Files.exists(srcDir.resolve("keep.txt")));
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.moveFile(srcDir.toString(), moveDest.toString()));
+    assertTrue(Files.isDirectory(srcDir), "真实目录不得被挪走");
+    assertFalse(Files.exists(moveDest));
+  }
+
+  @Test
+  @DisplayName("copy_file 拒绝指向目录的 symlink（不建空目录）")
+  void copyRejectsSymlinkToDirectory() throws IOException {
+    Path targetDir = dir.resolve("skill-body");
+    Files.createDirectories(targetDir);
+    Files.writeString(targetDir.resolve("SKILL.md"), "keep");
+    Path link = dir.resolve("skill-link");
+    try {
+      Files.createSymbolicLink(link, targetDir);
+    } catch (IOException | UnsupportedOperationException e) {
+      Assumptions.assumeTrue(false, "本机无法创建符号链接，跳过: " + e.getMessage());
+    }
+    Path dest = dir.resolve("out-copy");
+
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.copyFile(link.toString(), dest.toString()));
+    assertFalse(Files.exists(dest), "不得留下假成功的空目录");
+    assertTrue(Files.exists(targetDir.resolve("SKILL.md")));
+  }
+
+  @Test
+  @DisplayName("copy_file / move_file 拒绝覆盖目录目标（含 symlink→dir Skill 绑定）")
+  void copyAndMoveRejectDirectoryDestination() throws IOException {
+    Files.writeString(dir.resolve("payload.txt"), "x");
+    Path destDir = dir.resolve("dest-dir");
+    Files.createDirectories(destDir);
+    Files.writeString(destDir.resolve("keep.txt"), "stay");
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.copyFile(dir.resolve("payload.txt").toString(), destDir.toString()));
+    assertTrue(Files.isDirectory(destDir));
+    assertEquals("stay", Files.readString(destDir.resolve("keep.txt")));
+
+    Path skillBody = dir.resolve("skill-body-dst");
+    Files.createDirectories(skillBody);
+    Files.writeString(skillBody.resolve("SKILL.md"), "bound");
+    Path skillLink = dir.resolve("agents/ops/skills/report");
+    Files.createDirectories(skillLink.getParent());
+    try {
+      Files.createSymbolicLink(skillLink, skillBody);
+    } catch (IOException | UnsupportedOperationException e) {
+      Assumptions.assumeTrue(false, "本机无法创建符号链接，跳过: " + e.getMessage());
+    }
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.copyFile(dir.resolve("payload.txt").toString(), skillLink.toString()));
+    assertTrue(Files.isSymbolicLink(skillLink), "Skill 绑定链接不得被 REPLACE 毁掉");
+    assertEquals("bound", Files.readString(skillBody.resolve("SKILL.md")));
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.moveFile(dir.resolve("payload.txt").toString(), skillLink.toString()));
+    assertTrue(Files.isSymbolicLink(skillLink));
+    assertTrue(Files.exists(dir.resolve("payload.txt")), "拒绝后源文件应仍在");
+  }
+
+  @Test
   @DisplayName("delete_file 拒绝删除目录")
   void deleteRejectsDirectory() {
     assertThrows(IllegalArgumentException.class, () -> tools.deleteFile(dir.toString()));
+  }
+
+  @Test
+  @DisplayName("delete_file 可删指向目录的 symlink（不跟随目标）")
+  void deleteRemovesSymlinkToDirectoryWithoutRemovingTarget() throws IOException {
+    Path targetDir = dir.resolve("skill-body");
+    Files.createDirectories(targetDir);
+    Files.writeString(targetDir.resolve("SKILL.md"), "keep");
+    Path link = dir.resolve("skill-link");
+    try {
+      Files.createSymbolicLink(link, targetDir);
+    } catch (IOException | UnsupportedOperationException e) {
+      Assumptions.assumeTrue(false, "本机无法创建符号链接，跳过: " + e.getMessage());
+    }
+
+    String result = tools.deleteFile(link.toString());
+
+    assertTrue(result.contains("已删除"));
+    assertFalse(Files.exists(link), "应删除链接本身");
+    assertTrue(Files.isDirectory(targetDir), "目标目录不得被删");
+    assertTrue(Files.exists(targetDir.resolve("SKILL.md")));
   }
 
   @Test
@@ -77,6 +182,380 @@ class FileToolsTest {
   }
 
   @Test
+  @DisplayName("文件工具拒绝 Skill/Knowledge 内容写与 AGENT.md 直写")
+  void fileToolsRejectSkillKnowledgeAndAgentMd() throws IOException {
+    Path other = dir.resolve("other.txt");
+    Files.writeString(other, "x");
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.writeFile(dir.resolve("skills/report/SKILL.md").toString(), "bad"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.writeFile(dir.resolve("agents/demo/skills/report/SKILL.md").toString(), "bad"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.writeFile(dir.resolve("knowledge/ops/doc.md").toString(), "bad"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.writeFile(dir.resolve("agents/demo/AGENT.md").toString(), "bogus"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.makeDir(dir.resolve("agents/demo/skills/report").toString()));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.makeDir(dir.resolve("skills/occupied").toString()));
+    Path skillMd = dir.resolve("skills/report/SKILL.md");
+    Files.createDirectories(skillMd.getParent());
+    Files.writeString(skillMd, "keep\n");
+    assertThrows(IllegalArgumentException.class, () -> tools.deleteFile(skillMd.toString()));
+    assertTrue(Files.exists(skillMd), "共享 Skill 实体不得被 delete_file 删除");
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.moveFile(skillMd.toString(), dir.resolve("other-stolen.md").toString()));
+    assertTrue(Files.exists(skillMd), "共享 Skill 实体不得被 move_file 挪走");
+    Path link = dir.resolve("agents/demo/skills/report");
+    Files.createDirectories(link.getParent());
+    Path body = dir.resolve("skills/report");
+    Files.createDirectories(body);
+    try {
+      Files.createSymbolicLink(link, Path.of("../../../skills/report"));
+    } catch (IOException | UnsupportedOperationException e) {
+      Assumptions.assumeTrue(false, "本机无法创建符号链接，跳过: " + e.getMessage());
+    }
+    assertThrows(IllegalArgumentException.class, () -> tools.deleteFile(link.toString()));
+    assertTrue(Files.exists(link), "绑定叶子不得被 delete_file 拆除");
+  }
+
+  @Test
+  @DisplayName("文件工具拒绝直接改写 MEMORY.md（须走 save_memory）")
+  void fileToolsRejectDirectMemoryMdMutation() throws IOException {
+    Path memory = dir.resolve("agents/demo/MEMORY.md");
+    Files.createDirectories(memory.getParent());
+    Files.writeString(memory, "## 核心记忆\n- keep\n## 归档记忆\n");
+    String path = memory.toString();
+    Path other = dir.resolve("other.txt");
+    Files.writeString(other, "x");
+
+    assertThrows(IllegalArgumentException.class, () -> tools.writeFile(path, "hijack"));
+    assertThrows(IllegalArgumentException.class, () -> tools.editFile(path, "keep", "hijack"));
+    assertThrows(IllegalArgumentException.class, () -> tools.appendFile(path, "hijack\n"));
+    assertThrows(IllegalArgumentException.class, () -> tools.deleteFile(path));
+    assertThrows(IllegalArgumentException.class, () -> tools.makeDir(path));
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.moveFile(path, dir.resolve("x.md").toString()));
+    assertThrows(IllegalArgumentException.class, () -> tools.copyFile(other.toString(), path));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.writeFile(dir.resolve("memory.md").toString(), "case"));
+    assertEquals("## 核心记忆\n- keep\n## 归档记忆\n", Files.readString(memory), "拒绝后内容不得变");
+  }
+
+  @Test
+  @DisplayName("文件工具拒绝经软链改写 MEMORY.md（notes.md → MEMORY.md）")
+  void fileToolsRejectSymlinkToMemoryMd() throws IOException {
+    Path memory = dir.resolve("agents/demo/MEMORY.md");
+    Files.createDirectories(memory.getParent());
+    Files.writeString(memory, "## 核心记忆\n- keep\n## 归档记忆\n");
+    Path alias = dir.resolve("agents/demo/notes.md");
+    try {
+      Files.createSymbolicLink(alias, memory.getFileName());
+    } catch (IOException | UnsupportedOperationException e) {
+      Assumptions.assumeTrue(false, "当前环境无法创建软链: " + e.getMessage());
+    }
+
+    assertThrows(IllegalArgumentException.class, () -> tools.writeFile(alias.toString(), "hijack"));
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.appendFile(alias.toString(), "hijack\n"));
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.editFile(alias.toString(), "keep", "hijack"));
+    assertEquals("## 核心记忆\n- keep\n## 归档记忆\n", Files.readString(memory), "拒绝后内容不得变");
+  }
+
+  @Test
+  @DisplayName("文件工具拒绝经 MEMORY.md 子路径建目录（防 DoS save_memory）")
+  void fileToolsRejectMemoryMdAncestorPath() throws IOException {
+    Path agentDir = dir.resolve("agents/fresh");
+    Files.createDirectories(agentDir);
+    Path underMemory = agentDir.resolve("MEMORY.md/child.txt");
+
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.writeFile(underMemory.toString(), "hijack"));
+    assertTrue(Files.notExists(agentDir.resolve("MEMORY.md")), "拒绝后不得把 MEMORY.md 建成目录");
+  }
+
+  @Test
+  @DisplayName("文件工具拒绝直写 channels.yaml / mcp_servers.yaml")
+  void fileToolsRejectAdminConfigFiles() throws IOException {
+    Path channels = dir.resolve("channels.yaml");
+    Path mcp = dir.resolve("mcp_servers.yaml");
+    Path other = dir.resolve("other.txt");
+    Files.writeString(channels, "channels: []\n");
+    Files.writeString(mcp, "servers: []\n");
+    Files.writeString(other, "x");
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.writeFile(channels.toString(), "hijack"));
+    assertThrows(IllegalArgumentException.class, () -> tools.editFile(mcp.toString(), "[]", "x"));
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.appendFile(channels.toString(), "x\n"));
+    assertThrows(IllegalArgumentException.class, () -> tools.deleteFile(channels.toString()));
+    assertThrows(IllegalArgumentException.class, () -> tools.makeDir(channels.toString()));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> tools.moveFile(channels.toString(), dir.resolve("x.yaml").toString()));
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.copyFile(other.toString(), mcp.toString()));
+    assertEquals("channels: []\n", Files.readString(channels));
+    assertEquals("servers: []\n", Files.readString(mcp));
+  }
+
+  @Test
+  @DisplayName("read_file 拒绝读取 channels.yaml / mcp_servers.yaml / oryxos.db 原文")
+  void readFileRejectsReservedFiles() throws IOException {
+    Path channels = dir.resolve("channels.yaml");
+    Path mcp = dir.resolve("mcp_servers.yaml");
+    Path db = dir.resolve("oryxos.db");
+    Path wal = dir.resolve("oryxos.db-wal");
+    Files.writeString(channels, "token: SECRET-CHANNEL\n");
+    Files.writeString(mcp, "KEY: SECRET-MCP\n");
+    Files.writeString(db, "fake sqlite bytes SECRET-DB");
+    Files.writeString(wal, "fake wal bytes SECRET-WAL");
+
+    assertThrows(IllegalArgumentException.class, () -> tools.readFile(channels.toString()));
+    assertThrows(IllegalArgumentException.class, () -> tools.readFile(mcp.toString()));
+    assertThrows(IllegalArgumentException.class, () -> tools.readFile(db.toString()));
+    assertThrows(IllegalArgumentException.class, () -> tools.readFile(wal.toString()));
+  }
+
+  @Test
+  @DisplayName("read_file 拒绝经软链别名读 channels.yaml")
+  void readFileRejectsSymlinkAliasToReserved() throws IOException {
+    Path channels = dir.resolve("channels.yaml");
+    Files.writeString(channels, "token: SECRET-CHANNEL\n");
+    Path alias = dir.resolve("alias.yaml");
+    try {
+      Files.createSymbolicLink(alias, channels.getFileName());
+    } catch (IOException | UnsupportedOperationException e) {
+      Assumptions.assumeTrue(false, "当前环境无法创建软链: " + e.getMessage());
+    }
+
+    assertThrows(IllegalArgumentException.class, () -> tools.readFile(alias.toString()));
+  }
+
+  @Test
+  @DisplayName("copy_file 拒绝把保留文件复制成普通文件（防复制即泄露）")
+  void copyFileRejectsReservedSource() throws IOException {
+    Path channels = dir.resolve("channels.yaml");
+    Files.writeString(channels, "token: SECRET-CHANNEL\n");
+    Path leak = dir.resolve("leak.txt");
+
+    assertThrows(
+        IllegalArgumentException.class, () -> tools.copyFile(channels.toString(), leak.toString()));
+    assertFalse(Files.exists(leak), "拒绝后不得留下泄露副本");
+  }
+
+  @Test
+  @DisplayName("grep 跳过保留文件：凭证内容不进结果，普通文件照常命中并给出跳过提示")
+  void grepSkipsReservedFiles() throws IOException {
+    Files.writeString(dir.resolve("channels.yaml"), "token: SECRET-CHANNEL\n");
+    Files.writeString(dir.resolve("a.txt"), "normal needle line\n");
+
+    String result = tools.grep("SECRET|needle", dir.toString());
+
+    assertTrue(result.contains("a.txt:1:normal needle line"), result);
+    assertFalse(result.contains("SECRET-CHANNEL"), "保留文件内容不得出现在搜索结果: " + result);
+    assertFalse(result.contains("channels.yaml"), "保留文件名不得出现在命中行: " + result);
+    assertTrue(result.contains("已跳过"), "应提示跳过了保留文件: " + result);
+  }
+
+  @Test
+  @DisplayName("write_file 落盘前复检 FILE_WRITE（防校验窗口内路径逃逸）")
+  void writeFileRechecksPathBeforeWrite() {
+    AtomicInteger fileWrites = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_WRITE && fileWrites.incrementAndGet() >= 2) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    Path target = dir.resolve("escape.txt");
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(
+        SandboxViolationException.class, () -> guarded.writeFile(target.toString(), "secret"));
+    assertEquals(2, fileWrites.get(), "应在写前后各 enforce 一次 FILE_WRITE");
+    assertTrue(Files.notExists(target), "复检拒绝后不得落盘");
+  }
+
+  @Test
+  @DisplayName("make_dir 建目录后复检 FILE_WRITE（防校验窗口内路径逃逸）")
+  void makeDirRechecksPathAfterCreateDirectories() {
+    AtomicInteger fileWrites = new AtomicInteger();
+    Path nested = dir.resolve("nested");
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_WRITE) {
+            int n = fileWrites.incrementAndGet();
+            if (n >= 2) {
+              // 复检必须在 createDirectories 之后：此时目标目录应已存在
+              assertTrue(Files.isDirectory(nested), "复检应发生在 createDirectories 之后");
+              throw new SandboxViolationException("复检拒绝: " + action.target());
+            }
+          }
+        };
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(SandboxViolationException.class, () -> guarded.makeDir(nested.toString()));
+    assertEquals(2, fileWrites.get(), "应在建目录前与 createDirectories 后各 enforce 一次 FILE_WRITE");
+  }
+
+  @Test
+  @DisplayName("read_file 读取前复检 FILE_READ")
+  void readFileRechecksPathBeforeRead() throws IOException {
+    Path target = dir.resolve("secret.txt");
+    Files.writeString(target, "classified");
+    AtomicInteger fileReads = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_READ && fileReads.incrementAndGet() >= 2) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(SandboxViolationException.class, () -> guarded.readFile(target.toString()));
+    assertEquals(2, fileReads.get(), "应在读前后各 enforce 一次 FILE_READ");
+    assertEquals("classified", Files.readString(target), "复检拒绝后文件仍在");
+  }
+
+  @Test
+  @DisplayName("delete_file 删除前复检 FILE_WRITE")
+  void deleteFileRechecksPathBeforeDelete() throws IOException {
+    Path target = dir.resolve("keep.txt");
+    Files.writeString(target, "keep-me");
+    AtomicInteger fileWrites = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_WRITE && fileWrites.incrementAndGet() >= 2) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(SandboxViolationException.class, () -> guarded.deleteFile(target.toString()));
+    assertEquals(2, fileWrites.get());
+    assertTrue(Files.exists(target), "复检拒绝后不得删除");
+    assertEquals("keep-me", Files.readString(target));
+  }
+
+  @Test
+  @DisplayName("append_file 落盘前复检 FILE_WRITE")
+  void appendFileRechecksPathBeforeWrite() {
+    AtomicInteger fileWrites = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_WRITE && fileWrites.incrementAndGet() >= 2) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    Path target = dir.resolve("append-escape.txt");
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(SandboxViolationException.class, () -> guarded.appendFile(target.toString(), "x"));
+    assertEquals(2, fileWrites.get());
+    assertTrue(Files.notExists(target));
+  }
+
+  @Test
+  @DisplayName("edit_file 读前复检 FILE_WRITE（防 readString 窗口读出白名单）")
+  void editFileRechecksPathBeforeRead() throws IOException {
+    Path target = dir.resolve("edit-read.txt");
+    Files.writeString(target, "hello");
+    AtomicInteger fileWrites = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_WRITE && fileWrites.incrementAndGet() >= 2) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(
+        SandboxViolationException.class,
+        () -> guarded.editFile(target.toString(), "hello", "world"));
+    assertEquals(2, fileWrites.get(), "应在入口与 readString 前各 enforce 一次");
+    assertEquals("hello", Files.readString(target), "读前复检拒绝后不得改写");
+  }
+
+  @Test
+  @DisplayName("edit_file 写回前复检 FILE_WRITE")
+  void editFileRechecksPathBeforeWrite() throws IOException {
+    Path target = dir.resolve("edit.txt");
+    Files.writeString(target, "hello");
+    AtomicInteger fileWrites = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_WRITE && fileWrites.incrementAndGet() >= 3) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(
+        SandboxViolationException.class,
+        () -> guarded.editFile(target.toString(), "hello", "world"));
+    assertEquals(3, fileWrites.get(), "入口 / 读前 / 写前共三次 FILE_WRITE");
+    assertEquals("hello", Files.readString(target), "复检拒绝后不得改写");
+  }
+
+  @Test
+  @DisplayName("copy_file 落盘前复检 FILE_WRITE（防校验窗口内路径逃逸）")
+  void copyFileRechecksPathBeforeCopy() throws IOException {
+    Path src = dir.resolve("src.txt");
+    Files.writeString(src, "payload");
+    Path dst = dir.resolve("nested/out.txt");
+    AtomicInteger destWrites = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_WRITE
+              && action.target().equals(dst.toString())
+              && destWrites.incrementAndGet() >= 2) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(
+        SandboxViolationException.class, () -> guarded.copyFile(src.toString(), dst.toString()));
+    assertEquals(2, destWrites.get(), "目标应在 copy 前后各 enforce 一次 FILE_WRITE");
+    assertTrue(Files.notExists(dst), "复检拒绝后不得复制落盘");
+    assertTrue(Files.exists(src), "源应保留");
+  }
+
+  @Test
+  @DisplayName("move_file 落盘前复检 FILE_WRITE")
+  void moveFileRechecksPathBeforeMove() throws IOException {
+    Path src = dir.resolve("move-src.txt");
+    Files.writeString(src, "payload");
+    Path dst = dir.resolve("nested/moved.txt");
+    AtomicInteger destWrites = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_WRITE
+              && action.target().equals(dst.toString())
+              && destWrites.incrementAndGet() >= 2) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(
+        SandboxViolationException.class, () -> guarded.moveFile(src.toString(), dst.toString()));
+    assertEquals(2, destWrites.get());
+    assertTrue(Files.notExists(dst), "复检拒绝后不得移动落盘");
+    assertTrue(Files.exists(src), "源应保留");
+  }
+
+  @Test
   @DisplayName("list_dir 列出目录条目")
   void listDirShowsEntries() throws IOException {
     Files.writeString(dir.resolve("x.txt"), "");
@@ -86,6 +565,23 @@ class FileToolsTest {
 
     assertTrue(listing.contains("x.txt"));
     assertTrue(listing.contains("sub"));
+  }
+
+  @Test
+  @DisplayName("list_dir 列举前复检 FILE_READ")
+  void listDirRechecksPathBeforeList() throws IOException {
+    Files.writeString(dir.resolve("x.txt"), "");
+    AtomicInteger fileReads = new AtomicInteger();
+    Sandbox sandbox =
+        action -> {
+          if (action.type() == ActionType.FILE_READ && fileReads.incrementAndGet() >= 2) {
+            throw new SandboxViolationException("复检拒绝: " + action.target());
+          }
+        };
+    FileTools guarded = new FileTools(sandbox);
+
+    assertThrows(SandboxViolationException.class, () -> guarded.listDir(dir.toString()));
+    assertEquals(2, fileReads.get(), "应在 list 前后各 enforce 一次 FILE_READ");
   }
 
   @Test
@@ -196,6 +692,68 @@ class FileToolsTest {
 
     assertTrue(result.contains("x.yaml"));
     assertFalse(result.contains("y.txt"));
+  }
+
+  @Test
+  @DisplayName("grep/glob 能搜到目录软链目标（Skill 绑定形态）")
+  void grepAndGlobFollowDirectorySymlinkRoot() throws IOException {
+    Path realSkill = dir.resolve("skills/report");
+    Files.createDirectories(realSkill);
+    Files.writeString(realSkill.resolve("SKILL.md"), "title: needle-report\n");
+    Path link = dir.resolve("agents/ops/skills/report");
+    Files.createDirectories(link.getParent());
+    try {
+      Files.createSymbolicLink(link, realSkill);
+    } catch (IOException | UnsupportedOperationException e) {
+      Assumptions.assumeTrue(false, "本机无法创建符号链接，跳过: " + e.getMessage());
+    }
+
+    String listing = tools.listDir(link.toString());
+    assertTrue(listing.contains("SKILL.md"), "list_dir 应能列出软链目录");
+
+    String grepped = tools.grep("needle-report", link.toString());
+    assertTrue(grepped.contains("SKILL.md"), grepped);
+    assertTrue(grepped.contains("needle-report"), grepped);
+
+    String globbed = tools.glob("**/*.md", link.toString());
+    assertTrue(globbed.contains("SKILL.md"), globbed);
+  }
+
+  @Test
+  @DisplayName("read_file 对文本型 PDF 抽取正文（魔数或 .pdf 后缀）")
+  void readFileExtractsTextPdf() throws IOException {
+    Path pdf = dir.resolve("note.bin");
+    try (var doc = new org.apache.pdfbox.pdmodel.PDDocument()) {
+      var page = new org.apache.pdfbox.pdmodel.PDPage();
+      doc.addPage(page);
+      var font =
+          new org.apache.pdfbox.pdmodel.font.PDType1Font(
+              org.apache.pdfbox.pdmodel.font.Standard14Fonts.FontName.HELVETICA);
+      try (var cs = new org.apache.pdfbox.pdmodel.PDPageContentStream(doc, page)) {
+        cs.beginText();
+        cs.setFont(font, 12);
+        cs.newLineAtOffset(50, 700);
+        cs.showText("OryxOS PDF inbound ok");
+        cs.endText();
+      }
+      doc.save(pdf.toFile());
+    }
+    String text = tools.readFile(pdf.toString());
+    assertTrue(text.contains("OryxOS PDF inbound ok"), text);
+  }
+
+  @Test
+  @DisplayName("read_file 扫描件 PDF 错误信息包含无文本层根因")
+  void readFileScannedPdfSurfacesCause() throws IOException {
+    Path pdf = dir.resolve("scan.pdf");
+    try (var doc = new org.apache.pdfbox.pdmodel.PDDocument()) {
+      doc.addPage(new org.apache.pdfbox.pdmodel.PDPage());
+      doc.save(pdf.toFile());
+    }
+    UncheckedIOException ex =
+        assertThrows(UncheckedIOException.class, () -> tools.readFile(pdf.toString()));
+    assertTrue(ex.getMessage().contains("无文本层"), ex.getMessage());
+    assertTrue(ex.getMessage().contains(pdf.toString()), ex.getMessage());
   }
 
   @Test

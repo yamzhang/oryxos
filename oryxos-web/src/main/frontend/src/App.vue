@@ -1,9 +1,21 @@
 <script setup>
-import { ref, reactive, computed, nextTick } from 'vue'
+import { ref, reactive, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import logoUrl from './assets/logo.svg'
 import LoginView from './views/LoginView.vue'
+import RunManagementView from './features/runs/RunManagementView.vue'
+import { isNearBottom } from './chat-scroll.js'
+import { applyRunNav, parseRunNav, runHash, runListHash } from './features/runs/run-navigation.js'
+import { filterSkills, hiddenSelectedCount, selectAllVisible, clearVisible, renderSet } from './skill-filter.js'
+import {
+  blankGov,
+  createGovernanceEdit,
+  loadGovernance,
+  startEditGovernance as beginGovEdit,
+  cancelEditGovernance as abortGovEdit,
+  saveGovernance as persistGovernance,
+} from './features/governance/governance-edit.js'
 
 // —— 012-web-auth US3：登录守卫 —— 未登录先查 /api/v1/auth/me；登录页 LoginView 调 /auth/login
 const auth = reactive({ checking: true, enabled: true, username: null })
@@ -47,19 +59,26 @@ async function logout() {
 const TOP_NAV = [
   { key: 'overview', label: '概览' },
   { key: 'agents', label: 'Agent 列表' },
-  { key: 'schedules', label: '定时任务', path: '/api/v1/schedules' },
+  // 人格库（025）：copy-in 模板库独立成页，Agent 新建「从人格库导入」只负责选择，人格增删改统一在这里
+  { key: 'personas', label: '人格库' },
+  { key: 'schedules', label: '定时任务', path: '/api/v2/schedules' },
   // Skill 列表（第 32 节）：全局 Skill 库，自定义加载器（loadSkills）不走通用 path。知识库仍为占位页
   { key: 'skills', label: 'Skill 列表' },
   { key: 'knowledge', label: '知识库' },
+  { key: 'report', label: '审计' },
 ]
 
 const RUNTIME_NAV = [
+  { key: 'runs', label: '流式管理' },
   { key: 'sessions', label: '会话列表', path: '/api/v1/sessions' },
   { key: 'providers', label: 'Provider 列表' },
   { key: 'mcp', label: 'MCP 管理' },
   { key: 'tools', label: 'Tool 列表', path: '/api/v1/tools' },
   { key: 'notify-channels', label: 'Notify 渠道' },
+  { key: 'inbound-channels', label: '入站渠道' },
   { key: 'whitelist', label: 'SandBox 列表' },
+  { key: 'tool-policy', label: '工具策略' },
+  { key: 'exec-backend', label: '执行后端' },
 ]
 
 const NAV = [...TOP_NAV, ...RUNTIME_NAV]
@@ -148,7 +167,7 @@ const overviewCards = computed(() => [
 const overview = {
   tagline: '装在你自己基础设施上的分布式 AI Agent 操作系统 —— 统一底座运行多个业务 Agent',
   status: '运行中',
-  version: 'v0.1.0 · 开发预览',
+  version: 'v0.1.5 · RELEASE',
   capabilities: [
     { name: '对接 LLM', desc: '显式 Provider 映射，多家协议统一' },
     { name: 'ReAct 循环', desc: '自实现推理–行动循环，完全可控' },
@@ -164,7 +183,7 @@ function cols(key) {
   if (key === 'tools') return ['name', 'description']
   if (key === 'providers') return ['name', 'status']
   if (key === 'schedules')
-    return ['taskId', 'profileName', 'cron', 'zone', 'enabled', 'runCount', 'lastStatus', 'lastRunAt']
+    return ['name', 'profileName', 'key', 'cron', 'zone', 'enabled', 'runCount', 'lastStatus', 'lastRunAt']
   if (key === 'sessions')
     return ['sessionId', 'profileName', 'channel', 'status', 'messageCount', 'lastActiveAt']
   return []
@@ -185,36 +204,278 @@ async function load(key) {
   }
 }
 
-function select(key) {
+function select(key, options = {}) {
   active.value = key
   sessionDetail.value = null // 切页时收起会话详情
   execDetail.value = null // 切页时收起执行记录
   if (runtimeKeys.has(key)) runtimeOpen.value = true // 选中的是运行时子页 → 展开分组
   if (NAV.find((n) => n.key === key)?.path && !state[key]) load(key)
   if (key === 'agents') { agentDetail.value = null; fileView.value = null; loadAgents() }
+  if (key === 'personas') { cancelPersonaForm(); loadPersonaPresets() }
   if (key === 'notify-channels') { cancelNc(); loadNotifyChannels() }
+  if (key === 'inbound-channels') { closeInboundChannelDetail(); loadInboundChannels() }
   if (key === 'providers') { cancelPv(); loadProviders() }
   if (key === 'whitelist') { cancelWl(); loadWhitelist() }
+  if (key === 'tool-policy') { cancelTp(); loadToolPolicy() }
   if (key === 'mcp') { cancelMcp(); loadMcp(); loadMcpCatalog() }
   if (key === 'skills') { cancelSkill(); closeSkillDetail(); loadSkills() }
+  if (key === 'knowledge') { cancelKb(); closeKbDetail(); loadKnowledge() }
   if (key === 'overview') { loadOverviewStats() }
+  if (key === 'runs') {
+    runViewRef.value?.load?.()
+    if (!options.fromHash) writeRunHash(selectedRunId.value)
+  }
+  if (key === 'report') { loadReport() }
 }
 
 // 刷新当前页的列表：各页复用各自的加载函数（agents / notify-channels / 概览 / 其余按 path 的通用列表）
 function refresh() {
   const key = active.value
   if (key === 'agents') { loadAgents(); return }
+  if (key === 'personas') { loadPersonaPresets(); return }
   if (key === 'notify-channels') { loadNotifyChannels(); return }
+  if (key === 'inbound-channels') {
+    inboundChannelDetail.value ? openInboundChannelDetail(inboundChannelDetail.value.name) : loadInboundChannels()
+    return
+  }
   if (key === 'providers') { loadProviders(); return }
   if (key === 'whitelist') { loadWhitelist(); return }
+  if (key === 'exec-backend') { loadExecBackend(); return }
   if (key === 'mcp') { loadMcp(); return }
   if (key === 'skills') { loadSkills(); return }
+  if (key === 'knowledge') { kbDetail.value ? refreshKbDetail(kbDetail.value.name) : loadKnowledge(); return }
   if (key === 'overview') { loadOverviewStats(); return }
+  if (key === 'runs') { runViewRef.value?.load?.(); return }
+  if (key === 'report') { loadReport(); return }
   if (NAV.find((n) => n.key === key)?.path) load(key)
+}
+
+// —— 知识库（014）：列表/详情/创建/上传/重建/删除；管理操作按后端能力集渲染（FR-009）——
+const kb = ref({ loading: false, error: null, data: [] })
+const kbDetail = ref(null) // { name, base, documents, loading, error, busy }
+const kbForm = reactive({ open: false, name: '', description: '', busy: false, error: '' })
+async function loadKnowledge() {
+  kb.value = { loading: true, error: null, data: [] }
+  try {
+    const res = await fetch('/api/v1/knowledge')
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    kb.value = { loading: false, error: null, data: body.data || [] }
+  } catch (e) { kb.value = { loading: false, error: e.message, data: [] } }
+}
+function cancelKb() { kbForm.open = false; kbForm.name = ''; kbForm.description = ''; kbForm.busy = false; kbForm.error = '' }
+function closeKbDetail() { kbDetail.value = null }
+async function refreshKbDetail(name) {
+  kbDetail.value = { ...(kbDetail.value || { name }), name, loading: true, error: null, busy: false }
+  loadKbGovernance(name)
+  try {
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}`)
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    kbDetail.value = { name, base: body.data.base, documents: body.data.documents || [], loading: false, error: null, busy: false }
+    loadKbMetrics(kbMetrics.range)
+  } catch (e) { kbDetail.value = { name, base: null, documents: [], loading: false, error: e.message, busy: false } }
+}
+async function createKb() {
+  kbForm.busy = true; kbForm.error = ''
+  try {
+    const res = await fetch('/api/v1/knowledge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: kbForm.name.trim(), description: kbForm.description.trim() }),
+    })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '创建失败')
+    cancelKb(); await loadKnowledge()
+  } catch (e) { kbForm.error = e.message } finally { kbForm.busy = false }
+}
+async function deleteKb(name) {
+  if (!confirm(`删除知识库「${name}」？（目录与索引一并删除）`)) return
+  try {
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    const body = await res.json()
+    if (body.code !== 0) {
+      // 409：被 Agent 引用——点名引用方（FR-011）
+      const refs = (body.data?.references || []).map((r) => r.agentName).join('、')
+      throw new Error(refs ? `${body.message}（引用方：${refs}）` : (body.message || '删除失败'))
+    }
+    if (kbDetail.value?.name === name) closeKbDetail()
+    await loadKnowledge()
+  } catch (e) { kb.value = { ...kb.value, error: e.message } }
+}
+async function uploadKbDoc(event) {
+  const file = event.target.files?.[0]
+  event.target.value = '' // 允许重复选同一文件
+  if (!file || !kbDetail.value) return
+  const name = kbDetail.value.name
+  kbDetail.value = { ...kbDetail.value, busy: true, error: null }
+  try {
+    const form = new FormData()
+    form.append('file', file)
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}/documents`, { method: 'POST', body: form })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '上传失败')
+    await refreshKbDetail(name)
+  } catch (e) { kbDetail.value = { ...kbDetail.value, busy: false, error: e.message } }
+}
+async function reindexKb() {
+  if (!kbDetail.value) return
+  const name = kbDetail.value.name
+  kbDetail.value = { ...kbDetail.value, busy: true, error: null }
+  try {
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}/reindex`, { method: 'POST' })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '重建失败')
+    await refreshKbDetail(name)
+  } catch (e) { kbDetail.value = { ...kbDetail.value, busy: false, error: e.message } }
+}
+// —— 使用看板（FR-023）：只消费审计聚合；时间窗三档 ——
+const kbMetrics = reactive({ range: '7d', loading: false, error: null, data: null })
+function metricsFrom(range) {
+  const now = Date.now()
+  if (range === '7d') return new Date(now - 7 * 86400e3).toISOString()
+  if (range === '30d') return new Date(now - 30 * 86400e3).toISOString()
+  return new Date(0).toISOString()
+}
+async function loadKbMetrics(range) {
+  if (!kbDetail.value) return
+  kbMetrics.range = range || kbMetrics.range
+  kbMetrics.loading = true; kbMetrics.error = null
+  try {
+    const name = kbDetail.value.name
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}/metrics?from=${encodeURIComponent(metricsFrom(kbMetrics.range))}&to=${encodeURIComponent(new Date().toISOString())}`)
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    kbMetrics.data = body.data
+  } catch (e) { kbMetrics.error = e.message } finally { kbMetrics.loading = false }
+}
+function fmtRate(rate) { return rate == null ? '—' : (rate * 100).toFixed(2) + '%' }
+
+// —— 报表（016 审计看板）：只读审计聚合，KPI + 分布 + 明细下钻；时间窗三档 ——
+const report = reactive({ range: '7d', loading: false, error: null, llm: null, tool: null, byModel: [], byTool: [], byAgent: [], llmList: [], toolList: [] })
+function reportFrom(range) {
+  const now = Date.now()
+  if (range === '7d') return new Date(now - 7 * 86400e3).toISOString()
+  if (range === '30d') return new Date(now - 30 * 86400e3).toISOString()
+  return new Date(0).toISOString()
+}
+async function loadReport(range) {
+  report.range = range || report.range
+  report.loading = true; report.error = null
+  const q = `from=${encodeURIComponent(reportFrom(report.range))}&to=${encodeURIComponent(new Date().toISOString())}`
+  try {
+    const [llm, tool, byModel, byTool, byAgent, llmList, toolList] = await Promise.all([
+      fetch(`/api/v1/audit/llm/summary?${q}`).then((r) => r.json()),
+      fetch(`/api/v1/audit/tool/summary?${q}`).then((r) => r.json()),
+      fetch(`/api/v1/audit/llm/by-model?${q}`).then((r) => r.json()),
+      fetch(`/api/v1/audit/tool/by-name?${q}`).then((r) => r.json()),
+      fetch(`/api/v1/audit/by-agent?${q}`).then((r) => r.json()),
+      fetch(`/api/v1/audit/llm?${q}&limit=100`).then((r) => r.json()),
+      fetch(`/api/v1/audit/tool?${q}&limit=100`).then((r) => r.json()),
+    ])
+    for (const b of [llm, tool, byModel, byTool, byAgent, llmList, toolList]) {
+      if (b.code !== 0) throw new Error(b.message || '加载失败')
+    }
+    report.llm = llm.data
+    report.tool = tool.data
+    report.byModel = byModel.data || []
+    report.byTool = byTool.data || []
+    report.byAgent = byAgent.data || []
+    report.llmList = llmList.data || []
+    report.toolList = toolList.data || []
+  } catch (e) { report.error = e.message } finally { report.loading = false }
+}
+function fmtCost(micros) { return micros == null ? '—' : '¥' + (micros / 1e6).toFixed(4) }
+function barWidth(list, count) { return ((count / Math.max(1, ...list.map((x) => x.count))) * 100) + '%' }
+// 下钻过滤：点击分布项 → 过滤明细表（模型/工具/Agent 三维度）；点同一项再点一次 = 清除
+const reportFilter = ref(null) // { type: 'model' | 'tool' | 'agent', key }
+function setReportFilter(type, key) {
+  const next = reportFilter.value?.type === type && reportFilter.value?.key === key ? null : { type, key }
+  reportFilter.value = next
+  llmPage.page = 1
+  toolPage.page = 1
+  if (!next) return
+  // 点击分布项 → 自动展开对应明细表
+  if (type === 'model') reportExpand.llm = true
+  if (type === 'tool') reportExpand.tool = true
+  if (type === 'agent') { reportExpand.llm = true; reportExpand.tool = true }
+}
+function clearReportFilter() {
+  reportFilter.value = null
+  llmPage.page = 1
+  toolPage.page = 1
+}
+// 明细表折叠：默认折叠，点击标题展开
+const reportExpand = reactive({ llm: false, tool: false })
+// —— Trace 时间线（021）：按 trace ID 回放单轮全链路（LLM+工具合并时间序 + 成本/耗时汇总）；
+// 明细行与执行历史的 traceId 可点击填入查询框。摘要为服务端截断+脱敏后的展示值。 ——
+const trace = reactive({ id: '', loading: false, error: null, result: null })
+async function loadTrace(id) {
+  const q = (id ?? trace.id ?? '').trim()
+  if (!q) return
+  trace.id = q
+  trace.loading = true
+  trace.error = null
+  trace.result = null
+  try {
+    const res = await fetch(`/api/v1/audit/trace/${encodeURIComponent(q)}`)
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '查询失败')
+    trace.result = body.data
+  } catch (e) { trace.error = e.message } finally { trace.loading = false }
+}
+const filteredLlmList = computed(() => {
+  if (!reportFilter.value) return report.llmList
+  const { type, key } = reportFilter.value
+  if (type === 'model') return report.llmList.filter((c) => c.model === key)
+  if (type === 'agent') return report.llmList.filter((c) => (c.profileName || '(未归属)') === key)
+  return report.llmList
+})
+const filteredToolList = computed(() => {
+  if (!reportFilter.value) return report.toolList
+  const { type, key } = reportFilter.value
+  if (type === 'tool') return report.toolList.filter((t) => t.toolName === key)
+  if (type === 'agent') return report.toolList.filter((t) => (t.profileName || '(未归属)') === key)
+  return report.toolList
+})
+// 明细分页：每页默认 10 条，可改每页大小
+const llmPage = reactive({ page: 1, size: 10 })
+const toolPage = reactive({ page: 1, size: 10 })
+const totalLlmPages = computed(() => Math.max(1, Math.ceil(filteredLlmList.value.length / llmPage.size)))
+const totalToolPages = computed(() => Math.max(1, Math.ceil(filteredToolList.value.length / toolPage.size)))
+const pagedLlmList = computed(() => {
+  const start = (llmPage.page - 1) * llmPage.size
+  return filteredLlmList.value.slice(start, start + llmPage.size)
+})
+const pagedToolList = computed(() => {
+  const start = (toolPage.page - 1) * toolPage.size
+  return filteredToolList.value.slice(start, start + toolPage.size)
+})
+
+async function deleteKbDoc(relPath) {
+  if (!kbDetail.value) return
+  if (!confirm(`删除文档「${relPath}」？（源文件与索引片段一并删除）`)) return
+  const name = kbDetail.value.name
+  try {
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}/documents?path=${encodeURIComponent(relPath)}`, { method: 'DELETE' })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '删除失败')
+    await refreshKbDetail(name)
+  } catch (e) { kbDetail.value = { ...kbDetail.value, error: e.message } }
 }
 
 // —— Skill CRUD：.oryxos/skills/<name>/ 存在即已安装，Agent 通过本地相对软连接绑定。——
 const skills = ref({ loading: false, error: null, data: [] })
+// 028-agent-skill-filter：Skill 选择器共享筛选态（新建页与详情编辑页共用；视图互斥故单实例不互染）。
+// 选择集（agentCreate.skills / agentBinding.selected）与显示集（filterSkills 输出）解耦——筛选只影响显示。
+const skillFilter = reactive({ query: '', showHidden: false })
+// 新建页筛选视野与渲染集（computed：随 skills.data / skillFilter.query / agentCreate.skills 变化刷新）
+const createSkillVisible = computed(() => filterSkills(skills.value.data, skillFilter.query))
+const createSkillRender = computed(() => renderSet(createSkillVisible.value, skills.value.data, agentCreate.skills, skillFilter.showHidden))
+const createSkillHiddenCount = computed(() => hiddenSelectedCount(createSkillVisible.value, agentCreate.skills))
+// 详情编辑页筛选视野与渲染集（同型，绑 agentBinding.selected）
+const editSkillVisible = computed(() => filterSkills(skills.value.data, skillFilter.query))
+const editSkillRender = computed(() => renderSet(editSkillVisible.value, skills.value.data, agentBinding.selected, skillFilter.showHidden))
+const editSkillHiddenCount = computed(() => hiddenSelectedCount(editSkillVisible.value, agentBinding.selected))
 // 绑定一致性不在页面常驻展示：只在 Skill 变更（新建/编辑/归档/导入）后回检，
 // 发现残留或损坏绑定才展开告警面板，无问题保持静默；检查本身失败也会展开。
 const skillIssues = ref({ loading: false, error: null, data: [] })
@@ -305,6 +566,7 @@ const skillDetail = ref(null) // { name, description, body, loading, error, node
 async function openSkillDetail(row) {
   skillDetail.value = { name: row.name, description: row.description || '', body: row.body || '', loading: true, error: null, node: null }
   fileView.value = null // 从「未选中」开始，避免跨视图串台预览
+  loadSkillGovernance(row.name)
   try {
     const res = await fetch('/api/v1/workspace/tree')
     const body = await res.json()
@@ -326,6 +588,14 @@ const skillDetailBodyMd = computed(() =>
 
 // —— 会话详情：点一行会话，拉 GET /sessions/{id} 看完整对话内容 ——
 const sessionDetail = ref(null) // {loading, error, id, data:{sessionId, profileName, messages[]}}
+const sessionDetailScrollEl = ref(null)
+
+function scrollSessionDetailToBottom() {
+  nextTick(() => {
+    const el = sessionDetailScrollEl.value
+    if (el) el.scrollTop = el.scrollHeight
+  })
+}
 
 async function openSession(id) {
   sessionDetail.value = { loading: true, error: null, id, data: null }
@@ -334,6 +604,7 @@ async function openSession(id) {
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
     sessionDetail.value = { loading: false, error: null, id, data: body.data }
+    scrollSessionDetailToBottom()
   } catch (e) {
     sessionDetail.value = { loading: false, error: e.message, id, data: null }
   }
@@ -349,18 +620,18 @@ function roleLabel(role) {
 }
 
 // —— 定时任务管理动作（28 节：管理台可管，不再只读）——
-const busy = ref(null) // 正在操作的 taskId，防重复点击
+const busy = ref(null) // 正在操作的 scheduleId，防重复点击
 
 // 立即执行一次（POST /schedules/{id}/run），跑完刷新列表
-async function runTask(id) {
-  busy.value = id
+async function runTask(scheduleId) {
+  busy.value = scheduleId
   try {
-    const res = await fetch(`/api/v1/schedules/${id}/run`, { method: 'POST' })
+    const res = await fetch(`/api/v2/schedules/${encodeURIComponent(scheduleId)}/run`, { method: 'POST' })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '执行失败')
     await load('schedules')
     // 若正打开着这个任务的执行记录，跑完顺手刷新
-    if (execDetail.value?.taskId === id) await openExecutions(id)
+    if (execDetail.value?.scheduleId === scheduleId) await openExecutions(scheduleId)
   } catch (e) {
     state.schedules = { ...state.schedules, error: e.message }
   } finally {
@@ -369,17 +640,17 @@ async function runTask(id) {
 }
 
 // 执行记录历史：点"执行记录"拉 GET /schedules/{id}/executions
-const execDetail = ref(null) // {loading, error, taskId, data:[{startedAt,success,durationMs,errorMessage,sessionId}]}
+const execDetail = ref(null) // {loading, error, scheduleId, data:[{startedAt,success,durationMs,errorMessage,sessionId}]}
 
-async function openExecutions(taskId) {
-  execDetail.value = { loading: true, error: null, taskId, data: null }
+async function openExecutions(scheduleId) {
+  execDetail.value = { loading: true, error: null, scheduleId, data: null }
   try {
-    const res = await fetch(`/api/v1/schedules/${encodeURIComponent(taskId)}/executions`)
+    const res = await fetch(`/api/v2/schedules/${encodeURIComponent(scheduleId)}/executions`)
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
-    execDetail.value = { loading: false, error: null, taskId, data: body.data }
+    execDetail.value = { loading: false, error: null, scheduleId, data: body.data }
   } catch (e) {
-    execDetail.value = { loading: false, error: e.message, taskId, data: null }
+    execDetail.value = { loading: false, error: e.message, scheduleId, data: null }
   }
 }
 
@@ -389,9 +660,9 @@ function closeExecutions() {
 
 // 启用/停用（PUT /schedules/{id}），切换后刷新列表
 async function toggleTask(row) {
-  busy.value = row.taskId
+  busy.value = row.scheduleId
   try {
-    const res = await fetch(`/api/v1/schedules/${row.taskId}`, {
+    const res = await fetch(`/api/v2/schedules/${encodeURIComponent(row.scheduleId)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled: !row.enabled }),
@@ -409,6 +680,42 @@ async function toggleTask(row) {
 // —— 30 节：Agent 管理（动态增删改 + 一句话生成）——
 const agents = ref({ loading: false, error: null, data: [] })
 const triggering = ref(null) // 正在“立即触发”的 agent 名，防重复点击
+const selectedRunId = ref(null)
+const runViewRef = ref(null)
+
+function writeRunHash(runId) {
+  const next = runId ? runHash(runId) : runListHash()
+  if (location.hash === next) return
+  location.hash = next
+}
+
+function applyLocationHash() {
+  const parsed = parseRunNav(location.hash)
+  if (!parsed) return
+  const next = applyRunNav(location.hash, { page: active.value, runId: selectedRunId.value })
+  selectedRunId.value = parsed.runId
+  if (active.value !== 'runs' && next.page === 'runs') {
+    select('runs', { fromHash: true })
+  }
+}
+
+function openRunWorkbench(runId) {
+  selectedRunId.value = runId
+  select('runs')
+}
+
+function closeRunWorkbench() {
+  selectedRunId.value = null
+  writeRunHash(null)
+}
+
+onMounted(() => {
+  applyLocationHash()
+  window.addEventListener('hashchange', applyLocationHash)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('hashchange', applyLocationHash)
+})
 async function loadAgents() {
   agents.value = { loading: true, error: null, data: [] }
   try {
@@ -425,7 +732,8 @@ async function loadAgents() {
 // 只填 name + description 可直接按模板脚手架；也可先「用大模型生成」各文件、编辑后再创建。
 const agentCreate = reactive({
   open: false, name: '', description: '', provider: '', model: '', notifyChannel: '', skills: [],
-  requiredSkills: [], suggestedSkills: [], files: null, busy: false, error: '',
+  requiredSkills: [], suggestedSkills: [], knowledge: [], suggestedKnowledge: [],
+  files: null, busy: false, error: '',
 })
 
 // 新建页用的 provider / model 下拉数据源：provider 来自 GET /providers；model 来自 GET /providers/{name}/models（服务端代理）
@@ -463,11 +771,15 @@ function openCreate() {
   agentCreate.skills = []
   agentCreate.requiredSkills = []
   agentCreate.suggestedSkills = []
+  agentCreate.knowledge = []
+  agentCreate.suggestedKnowledge = []
   agentCreate.files = null
   agentCreate.busy = false
   agentCreate.error = ''
+  skillFilter.query = ''; skillFilter.showHidden = false // 进入新建页清空筛选态
   loadNotifyChannels()
   loadSkills() // Skill 选择器的数据源（可手动指定必启用的 Skill；不选则由作者模型自动选）
+  loadKnowledge() // 知识库多选的数据源（FR-018 关联入口之一）
   loadCreateProviders() // provider 下拉数据源
 }
 
@@ -488,6 +800,9 @@ async function generateFiles() {
     agentCreate.requiredSkills = body.data.requiredSkills || []
     agentCreate.suggestedSkills = body.data.suggestedSkills || []
     agentCreate.skills = body.data.bindingSkills || []
+    // 一句话生成的知识库绑定建议（FR-018）：合并进选择器，作者确认后随创建生效
+    agentCreate.suggestedKnowledge = body.data.bindingKnowledge || []
+    agentCreate.knowledge = Array.from(new Set([...agentCreate.knowledge, ...agentCreate.suggestedKnowledge]))
   } catch (e) { agentCreate.error = e.message } finally { agentCreate.busy = false }
 }
 
@@ -499,17 +814,187 @@ async function submitCreate() {
     const res = agentCreate.files
       ? await fetch(`/api/v1/agents/${encodeURIComponent(agentCreate.name)}/files`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ files: agentCreate.files, skillBindings: agentCreate.skills }),
+          body: JSON.stringify({ files: agentCreate.files, skillBindings: agentCreate.skills, knowledgeBindings: agentCreate.knowledge }),
         })
         : await fetch('/api/v1/agents', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: agentCreate.name, description: agentCreate.description, provider: agentCreate.provider || undefined, model: agentCreate.model || undefined, skillBindings: agentCreate.skills }),
+          body: JSON.stringify({ name: agentCreate.name, description: agentCreate.description, provider: agentCreate.provider || undefined, model: agentCreate.model || undefined, skillBindings: agentCreate.skills, knowledgeBindings: agentCreate.knowledge }),
         })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '创建失败')
     agentCreate.open = false
     await loadAgents()
   } catch (e) { agentCreate.error = e.message } finally { agentCreate.busy = false }
+}
+
+// —— 从人格库导入（025 Web 导入）：Agent 新建页「从人格库导入」入口（12 内置 + 自定义）——
+// 与「一句话生成」同一页，顶部切换模式；两条路都收敛到 import-preview → import → saveFiles 校验链。
+// 人格的新建/编辑/删除统一在左侧「人格库」页操作；这里只负责选中某个人格、上传/粘贴 .md、预览、落盘。
+const createMode = ref('llm') // 新建页模式：'llm' 一句话生成 / 'import' 人格库导入
+const personaPresets = ref({ loading: false, error: null, data: [] })
+const personaPageError = ref('') // 人格库页的页面级错误（删除失败等，非弹框内）
+const agentImport = reactive({
+  sourceContent: '', name: '', selected: '', provider: '', model: '', preview: null, busy: false, error: '',
+})
+function onImportProviderChange() { agentImport.model = ''; loadCreateModels(agentImport.provider) }
+function setCreateMode(m) {
+  createMode.value = m
+  if (m === 'import') {
+    if (!personaPresets.value.data.length && !personaPresets.value.loading) loadPersonaPresets()
+    if (!createProviders.value.data.length && !createProviders.value.loading) loadCreateProviders()
+  }
+}
+async function loadPersonaPresets() {
+  personaPresets.value = { loading: true, error: null, data: [] }
+  try {
+    const res = await fetch('/api/v1/personas')
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    personaPresets.value = { loading: false, error: null, data: body.data || [] }
+    personaPageError.value = ''
+  } catch (e) { personaPresets.value = { loading: false, error: e.message, data: [] } }
+}
+// 选中人格：拉源文件全文作导入草稿，Agent 名建议用 key（中文 displayName 派生不出合法 slug）。写/改人格去「人格库」页
+async function pickPreset(p) {
+  agentImport.selected = p.key
+  agentImport.name = p.key
+  agentImport.preview = null
+  agentImport.error = ''
+  agentImport.busy = true
+  try {
+    const res = await fetch(`/api/v1/personas/${encodeURIComponent(p.key)}`)
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    agentImport.sourceContent = body.data.sourceContent
+  } catch (e) { agentImport.error = e.message } finally { agentImport.busy = false }
+}
+// 上传 .md 文件：读文本作导入草稿，Agent 名从文件名推合法 slug
+function onImportFile(evt) {
+  const file = evt.target && evt.target.files && evt.target.files[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    agentImport.sourceContent = String(reader.result || '')
+    agentImport.selected = ''
+    agentImport.preview = null
+    const base = (file.name || '').replace(/\.md$/i, '').replace(/[^A-Za-z0-9_-]/g, '')
+    agentImport.name = base || agentImport.name
+  }
+  reader.readAsText(file)
+}
+// 预览：不落盘，返回渲染出的 AGENT.md + 人格字段投影（确认前可改 Agent 名 / 源文件内容再重预览）
+async function previewImport() {
+  if (!agentImport.sourceContent.trim()) { agentImport.error = '请先选择预设或粘贴源文件内容'; return }
+  agentImport.busy = true; agentImport.error = ''
+  try {
+    const res = await fetch('/api/v1/agents/import-preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceContent: agentImport.sourceContent, name: agentImport.name || undefined,
+        provider: agentImport.provider || undefined, model: agentImport.model || undefined,
+      }),
+    })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '预览失败')
+    agentImport.preview = body.data
+    if (body.data.name) agentImport.name = body.data.name
+  } catch (e) { agentImport.error = e.message } finally { agentImport.busy = false }
+}
+// 确认导入：落盘并注册（importAgent 走 saveFiles 校验链），成功后直接进详情
+async function submitImport() {
+  if (!agentImport.sourceContent.trim()) return
+  if (!agentImport.name.trim()) { agentImport.error = '请填写 Agent 名'; return }
+  agentImport.busy = true; agentImport.error = ''
+  try {
+    const res = await fetch('/api/v1/agents/import', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceContent: agentImport.sourceContent, name: agentImport.name,
+        provider: agentImport.provider || undefined, model: agentImport.model || undefined,
+      }),
+    })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '导入失败')
+    const imported = body.data
+    cancelCreate()
+    await loadAgents()
+    openAgent(imported)
+  } catch (e) { agentImport.error = e.message } finally { agentImport.busy = false }
+}
+
+// —— 人格库页（copy-in 模板库）管理：新建/编辑/查看共用一个弹框，源文件原文即库内容 ——
+const personaForm = reactive({ open: false, editing: false, viewOnly: false, key: '', sourceContent: '', busy: false, error: '' })
+function openPersonaEditor() {
+  personaForm.open = true; personaForm.editing = false; personaForm.viewOnly = false
+  personaForm.key = ''; personaForm.sourceContent = ''; personaForm.error = ''; personaForm.busy = false
+}
+function cancelPersonaForm() { personaForm.open = false }
+// 从本地 .md 文件导入人格源文件草稿：内容读入下方文本框；新建且 key 为空时从文件名派生合法 slug（可改）
+function onPersonaFile(evt) {
+  const file = evt.target && evt.target.files && evt.target.files[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    personaForm.sourceContent = String(reader.result || '')
+    if (!personaForm.editing && !personaForm.key.trim()) {
+      personaForm.key = (file.name || '').replace(/\.md$/i, '').replace(/[^A-Za-z0-9_-]/g, '')
+    }
+    personaForm.error = ''
+  }
+  reader.readAsText(file)
+  evt.target.value = '' // 重置 input，允许连续选同一个文件
+}
+// 编辑/查看先拉详情（源全文），就绪再开弹框，避免闪现空文本框
+async function editPersona(p) {
+  personaForm.busy = true; personaForm.error = ''
+  try {
+    const res = await fetch(`/api/v1/personas/${encodeURIComponent(p.key)}`)
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    personaForm.open = true; personaForm.editing = true; personaForm.viewOnly = false
+    personaForm.key = p.key; personaForm.sourceContent = body.data.sourceContent; personaForm.busy = false
+  } catch (e) { personaPageError.value = e.message; personaForm.busy = false }
+}
+async function viewPersona(p) {
+  personaForm.busy = true; personaForm.error = ''
+  try {
+    const res = await fetch(`/api/v1/personas/${encodeURIComponent(p.key)}`)
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    personaForm.open = true; personaForm.editing = false; personaForm.viewOnly = true
+    personaForm.key = p.key; personaForm.sourceContent = body.data.sourceContent; personaForm.busy = false
+  } catch (e) { personaPageError.value = e.message; personaForm.busy = false }
+}
+// 保存：编辑走 PUT（key 不可改），新建走 POST；内置 key 后端 400 只读
+async function savePersonaForm() {
+  const key = (personaForm.key || '').trim()
+  if (!key) { personaForm.error = '请填写 key'; return }
+  if (!personaForm.sourceContent.trim()) { personaForm.error = '人格内容不能为空'; return }
+  personaForm.busy = true; personaForm.error = ''
+  try {
+    const res = await fetch(personaForm.editing ? `/api/v1/personas/${encodeURIComponent(key)}` : '/api/v1/personas', {
+      method: personaForm.editing ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, sourceContent: personaForm.sourceContent }),
+    })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '保存失败')
+    personaForm.open = false
+    await loadPersonaPresets()
+  } catch (e) { personaForm.error = e.message } finally { personaForm.busy = false }
+}
+// 删除自定义人格（物理删，不可撤销）：内置只读（后端 400）；删的是导入页当前选中项时清空选中
+async function deletePersona(p) {
+  if (p.builtin) { personaPageError.value = '内置人格只读，不能删除'; return }
+  if (!window.confirm(`删除自定义人格「${p.label}」？此操作不可撤销。`)) return
+  personaPageError.value = ''
+  try {
+    const res = await fetch(`/api/v1/personas/${encodeURIComponent(p.key)}`, { method: 'DELETE' })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '删除失败')
+    if (agentImport.selected === p.key) { agentImport.selected = '' }
+    await loadPersonaPresets()
+  } catch (e) { personaPageError.value = e.message }
 }
 
 // 立即触发一次（异步）：后端立即返回执行记录 id，ReAct 在后台跑——不再干等整轮（消除 Failed to fetch）。
@@ -524,7 +1009,7 @@ async function triggerAgent(a) {
     })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '触发失败')
-    alert(`【${a.name}】已触发，正在后台执行（执行 #${body.data?.executionId}）。\n\n进度看「详情 → 执行历史」，结果看「详情 → 会话」。`)
+    openRunWorkbench(body.data?.executionId)
   } catch (e) {
     alert(`【${a.name}】触发失败：${e.message}`)
   } finally {
@@ -543,7 +1028,7 @@ async function deleteAgent(name) {
   } catch (e) { agents.value = { ...agents.value, error: e.message } }
 }
 
-// —— Notify 渠道管理（CRUD /api/v1/notify-channels）：命名的通知出口，type ∈ feishu/wecom/dingtalk/webhook ——
+// —— Notify 渠道管理（CRUD /api/v1/notify-channels）：命名的通知出口，含 026 海外 IM ——
 const notifyChannels = ref({ loading: false, error: null, data: [] })
 async function loadNotifyChannels() {
   notifyChannels.value = { loading: true, error: null, data: [] }
@@ -558,7 +1043,44 @@ async function loadNotifyChannels() {
 }
 
 // 新建/编辑表单：editing 存被编辑渠道的 name（此时 name 只读），null 表示新建
-const nc = reactive({ open: false, editing: null, name: '', type: 'feishu', url: '', description: '', busy: false, error: null })
+const nc = reactive({ open: false, editing: null, name: '', type: 'feishu', url: '', description: '', host: '', port: '', from: '', to: '', username: '', password: '', subject: '', encryption: '', token: '', chatId: '', channelId: '', phoneNumberId: '', homeserver: '', roomId: '', groupOpenid: '', userOpenid: '', busy: false, error: null })
+
+function notifyNeedsUrl(type) {
+  return !['email', 'telegram', 'slack', 'discord', 'whatsapp', 'matrix', 'qq'].includes(type)
+}
+
+function buildNotifyConfig() {
+  if (nc.type === 'email') return buildEmailConfig()
+  const config = {}
+  if (nc.token) config.token = nc.token
+  if (nc.type === 'telegram' && nc.chatId) config.chat_id = nc.chatId
+  if ((nc.type === 'slack' || nc.type === 'discord') && nc.channelId) config.channel_id = nc.channelId
+  if (nc.type === 'whatsapp') {
+    if (nc.phoneNumberId) config.phone_number_id = nc.phoneNumberId
+    if (nc.to) config.to = nc.to
+  }
+  if (nc.type === 'matrix') {
+    if (nc.homeserver) config.homeserver = nc.homeserver
+    if (nc.roomId) config.room_id = nc.roomId
+  }
+  if (nc.type === 'qq') {
+    if (nc.groupOpenid) config.group_openid = nc.groupOpenid
+    if (nc.userOpenid) config.user_openid = nc.userOpenid
+  }
+  return Object.keys(config).length ? config : undefined
+}
+
+function notifyFormReady() {
+  if (!nc.name) return false
+  if (nc.type === 'email') return !!(nc.host && nc.port && nc.from && nc.to)
+  if (nc.url) return true
+  if (nc.type === 'telegram') return !!(nc.token && nc.chatId)
+  if (nc.type === 'slack' || nc.type === 'discord') return !!(nc.token && nc.channelId)
+  if (nc.type === 'whatsapp') return !!(nc.token && nc.phoneNumberId && nc.to)
+  if (nc.type === 'matrix') return !!(nc.homeserver && nc.token && nc.roomId)
+  if (nc.type === 'qq') return !!(nc.token && (nc.groupOpenid || nc.userOpenid))
+  return false
+}
 
 async function saveNotifyChannel() {
   nc.busy = true; nc.error = null
@@ -566,9 +1088,10 @@ async function saveNotifyChannel() {
     const url = nc.editing
       ? `/api/v1/notify-channels/${encodeURIComponent(nc.editing)}`
       : '/api/v1/notify-channels'
-    const payload = nc.editing
-      ? { type: nc.type, url: nc.url, description: nc.description }
-      : { name: nc.name, type: nc.type, url: nc.url, description: nc.description }
+    const config = buildNotifyConfig()
+    let payload = { type: nc.type, url: nc.type === 'email' ? '' : nc.url, description: nc.description }
+    if (config) payload.config = config
+    if (!nc.editing) payload = { name: nc.name, ...payload }
     const res = await fetch(url, {
       method: nc.editing ? 'PUT' : 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -586,12 +1109,30 @@ function editNotifyChannel(row) {
   nc.type = row.type || 'feishu'
   nc.url = row.url || ''
   nc.description = row.description || ''
+  const c = row.config || {}
+  nc.host = c.host || ''; nc.port = c.port || ''; nc.from = c.from || ''; nc.to = c.to || ''
+  nc.username = c.username || ''; nc.password = c.password || ''; nc.subject = c.subject || ''; nc.encryption = c.encryption || ''
+  nc.token = c.token || ''; nc.chatId = c.chat_id || ''; nc.channelId = c.channel_id || ''
+  nc.phoneNumberId = c.phone_number_id || ''; nc.homeserver = c.homeserver || ''; nc.roomId = c.room_id || ''
+  nc.groupOpenid = c.group_openid || ''; nc.userOpenid = c.user_openid || ''
   nc.error = null
   nc.open = true
 }
 
+function buildEmailConfig() {
+  const config = {}
+  for (const k of ['host', 'port', 'from', 'to', 'username', 'password', 'subject', 'encryption']) {
+    if (nc[k]) config[k] = nc[k]
+  }
+  return config
+}
+
 function cancelNc() {
-  nc.open = false; nc.editing = null; nc.name = ''; nc.type = 'feishu'; nc.url = ''; nc.description = ''; nc.error = null
+  nc.open = false; nc.editing = null; nc.name = ''; nc.type = 'feishu'; nc.url = ''; nc.description = ''
+  nc.host = ''; nc.port = ''; nc.from = ''; nc.to = ''; nc.username = ''; nc.password = ''; nc.subject = ''; nc.encryption = ''
+  nc.token = ''; nc.chatId = ''; nc.channelId = ''; nc.phoneNumberId = ''; nc.homeserver = ''; nc.roomId = ''
+  nc.groupOpenid = ''; nc.userOpenid = ''
+  nc.error = null
 }
 
 async function deleteNotifyChannel(name) {
@@ -616,6 +1157,34 @@ async function loadProviders() {
     providers.value = { loading: false, error: null, data: body.data || [] }
   } catch (e) {
     providers.value = { loading: false, error: e.message, data: [] }
+  }
+  loadPricing()
+}
+
+async function testProvider(name) {
+  providerTests.value = {
+    ...providerTests.value,
+    [name]: { loading: true, ok: null, message: '测试中…' },
+  }
+  try {
+    const res = await fetch(`/api/v1/providers/${encodeURIComponent(name)}/test`, { method: 'POST' })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '连通测试失败')
+    const data = body.data || {}
+    const samples = (data.sampleModels || []).slice(0, 3).join('、')
+    providerTests.value = {
+      ...providerTests.value,
+      [name]: {
+        loading: false,
+        ok: true,
+        message: samples ? `可用 · ${data.modelCount || 0} 个模型 · ${samples}` : `可用 · ${data.modelCount || 0} 个模型`,
+      },
+    }
+  } catch (e) {
+    providerTests.value = {
+      ...providerTests.value,
+      [name]: { loading: false, ok: false, message: e.message || '连通测试失败' },
+    }
   }
 }
 
@@ -691,6 +1260,59 @@ async function deleteProvider(name) {
     if (body.code !== 0) throw new Error(body.message || '删除失败')
     await loadProviders()
   } catch (e) { providers.value = { ...providers.value, error: e.message } }
+}
+
+// —— 模型定价（016 审计看板）：(provider, model) → 输入/输出 token 单价（元/百万 token）——
+const pricing = ref({ loading: false, error: null, data: [] })
+const pricingForm = reactive({ open: false, editing: null, provider: '', model: '', promptPrice: '', completionPrice: '', busy: false, error: null })
+async function loadPricing() {
+  pricing.value = { loading: true, error: null, data: [] }
+  try {
+    const res = await fetch('/api/v1/pricing')
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    pricing.value = { loading: false, error: null, data: body.data || [] }
+  } catch (e) { pricing.value = { loading: false, error: e.message, data: [] } }
+}
+function openPricingForm(row) {
+  pricingForm.editing = row?.id ?? null
+  pricingForm.provider = row?.provider ?? ''
+  pricingForm.model = row?.model ?? ''
+  pricingForm.promptPrice = row?.promptPrice ?? ''
+  pricingForm.completionPrice = row?.completionPrice ?? ''
+  pricingForm.error = null
+  pricingForm.open = true
+}
+function cancelPricing() {
+  pricingForm.open = false; pricingForm.editing = null; pricingForm.provider = ''; pricingForm.model = ''; pricingForm.promptPrice = ''; pricingForm.completionPrice = ''; pricingForm.error = null
+}
+function parsePrice(v) { return v === '' || v == null ? null : Number(v) }
+async function savePricing() {
+  pricingForm.busy = true; pricingForm.error = null
+  try {
+    const prices = { promptPrice: parsePrice(pricingForm.promptPrice), completionPrice: parsePrice(pricingForm.completionPrice) }
+    const payload = pricingForm.editing
+      ? prices
+      : { provider: pricingForm.provider.trim(), model: pricingForm.model.trim(), ...prices }
+    const url = pricingForm.editing ? `/api/v1/pricing/${pricingForm.editing}` : '/api/v1/pricing'
+    const res = await fetch(url, {
+      method: pricingForm.editing ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '保存失败')
+    cancelPricing(); await loadPricing()
+  } catch (e) { pricingForm.error = e.message } finally { pricingForm.busy = false }
+}
+async function deletePricing(id) {
+  if (!confirm('删除这条模型定价？')) return
+  try {
+    const res = await fetch(`/api/v1/pricing/${id}`, { method: 'DELETE' })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '删除失败')
+    await loadPricing()
+  } catch (e) { pricing.value = { ...pricing.value, error: e.message } }
 }
 
 // —— MCP 管理（CRUD /api/v1/mcp-servers + 内置目录一键启用）：31 节 ——
@@ -829,27 +1451,42 @@ async function submitEnable() {
   } catch (e) { mcpEnable.error = e.message } finally { mcpEnable.busy = false }
 }
 
-// —— Sandbox 白名单管理（CRUD /api/v1/sandbox/whitelist）：三类 file/shell/http 的白名单条目 ——
+// —— 执行后端状态（024 US3，只读 /api/v1/sandbox/execution/status）：档位 / daemon 探测 / 限额 / 覆写一览 ——
+const exec = ref({ loading: false, error: null, data: null })
+async function loadExecBackend() {
+  exec.value = { loading: true, error: null, data: null }
+  try {
+    const res = await fetch('/api/v1/sandbox/execution/status')
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    exec.value = { loading: false, error: null, data: body.data }
+  } catch (e) {
+    exec.value = { loading: false, error: e.message, data: null }
+  }
+}
+
+// —— Sandbox 白名单管理（CRUD /api/v1/sandbox/whitelist）：四类 file/shell/http/smtp 的白名单条目 ——
 const WL_CATS = [
   { key: 'file', label: '文件路径', ph: '允许访问的路径，如 /data 或 /tmp/*' },
-  { key: 'shell', label: 'Shell 命令', ph: '允许执行的命令首 token，如 ls' },
+  { key: 'shell', label: '可执行文件', ph: '允许执行的可执行文件，如 python3（授予本机代码执行权限）' },
   { key: 'http', label: 'HTTP 域名', ph: '允许访问的域名，如 *.example.com' },
+  { key: 'smtp', label: 'SMTP 端点', ph: '允许发信的邮件服务器，如 mail.example.com:25' },
 ]
-const wl = ref({ loading: false, error: null, file: [], shell: [], http: [] })
+const wl = ref({ loading: false, error: null, file: [], shell: [], http: [], smtp: [] })
 async function loadWhitelist() {
-  wl.value = { loading: true, error: null, file: [], shell: [], http: [] }
+  wl.value = { loading: true, error: null, file: [], shell: [], http: [], smtp: [] }
   try {
     const res = await fetch('/api/v1/sandbox/whitelist')
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
     const d = body.data || {}
-    wl.value = { loading: false, error: null, file: d.file || [], shell: d.shell || [], http: d.http || [] }
+    wl.value = { loading: false, error: null, file: d.file || [], shell: d.shell || [], http: d.http || [], smtp: d.smtp || [] }
   } catch (e) {
-    wl.value = { loading: false, error: e.message, file: [], shell: [], http: [] }
+    wl.value = { loading: false, error: e.message, file: [], shell: [], http: [], smtp: [] }
   }
 }
 
-// 新增白名单表单：category ∈ file/shell/http，value 为一条白名单条目
+// 新增白名单表单：category ∈ file/shell/http/smtp，value 为一条白名单条目
 const wlForm = reactive({ open: false, category: 'file', value: '', busy: false, error: null })
 const wlPlaceholder = computed(() => WL_CATS.find((c) => c.key === wlForm.category)?.ph || '')
 
@@ -878,9 +1515,63 @@ async function deleteWhitelist(category, value) {
   } catch (e) { wl.value = { ...wl.value, error: e.message } }
 }
 
+// —— 工具策略管理（020：CRUD /api/v1/tool-policy）：全局 deny / Agent 例外 / Agent 收紧 + 每 Agent 有效工具集 ——
+const TP_TYPES = [
+  { key: 'GLOBAL_DENY', label: '全局禁用', needAgent: false },
+  { key: 'AGENT_EXEMPT', label: 'Agent 例外（豁免全局禁用）', needAgent: true },
+  { key: 'AGENT_DENY', label: 'Agent 定向禁用', needAgent: true },
+]
+const tp = ref({ loading: false, error: null, rules: [], effective: [], denied: [] })
+async function loadToolPolicy() {
+  tp.value = { loading: true, error: null, rules: [], effective: [], denied: [] }
+  try {
+    const res = await fetch('/api/v1/tool-policy')
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    // 策略拒绝的调用记录（审计筛选，FR-006/SC-005）
+    const auditRes = await fetch('/api/v1/audit/tool?blockedBy=policy&limit=50')
+    const auditBody = await auditRes.json()
+    tp.value = {
+      loading: false, error: null,
+      rules: body.data.rules || [], effective: body.data.effective || [],
+      denied: auditBody.code === 0 ? (auditBody.data || []) : [],
+    }
+  } catch (e) {
+    tp.value = { loading: false, error: e.message, rules: [], effective: [], denied: [] }
+  }
+}
+const tpForm = reactive({ open: false, ruleType: 'GLOBAL_DENY', agentName: '', pattern: '', busy: false, error: null })
+const tpNeedAgent = computed(() => TP_TYPES.find((t) => t.key === tpForm.ruleType)?.needAgent)
+function tpTypeLabel(type) { return TP_TYPES.find((t) => t.key === type)?.label || type }
+async function addToolPolicyRule() {
+  tpForm.busy = true; tpForm.error = null
+  try {
+    const payload = { ruleType: tpForm.ruleType, pattern: tpForm.pattern }
+    if (tpNeedAgent.value) payload.agentName = tpForm.agentName
+    const res = await fetch('/api/v1/tool-policy/rules', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '新增失败')
+    cancelTp(); await loadToolPolicy()
+  } catch (e) { tpForm.error = e.message } finally { tpForm.busy = false }
+}
+function cancelTp() { tpForm.open = false; tpForm.ruleType = 'GLOBAL_DENY'; tpForm.agentName = ''; tpForm.pattern = ''; tpForm.error = null }
+async function deleteToolPolicyRule(rule) {
+  if (!confirm(`删除策略规则「${tpTypeLabel(rule.ruleType)} ${rule.pattern}」？删除即刻生效。`)) return
+  try {
+    const res = await fetch(`/api/v1/tool-policy/rules/${rule.id}`, { method: 'DELETE' })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '删除失败')
+    await loadToolPolicy()
+  } catch (e) { tp.value = { ...tp.value, error: e.message } }
+}
+
 // —— Agent 详情：Tab 切换（基本信息 / 文件 / 会话 / 记忆）——
 const agentDetail = ref(null) // { name, agent, tab, loading, error, node, editing }
-const agentBinding = reactive({ selected: [], saving: false, error: null, issues: [] })
+const agentBinding = reactive({ selected: [], saving: false, error: null, issues: [], saved: false })
+const agentKb = reactive({ selected: [], saving: false, error: null, issues: [], saved: false })
 const fileView = ref(null) // { path, loading, error, content, saving, saved }
 // 详情页「编辑基本信息」表单态 + 编辑态的 model 下拉数据源（与新建页的 createModels 分开，避免串台）
 const editBasic = reactive({ description: '', provider: '', model: '' })
@@ -898,7 +1589,7 @@ const renderedMd = computed(() =>
     : ''
 )
 // 会话：每个 Agent 一个固定 session，直接作为对话展示（不再是会话列表）
-const chat = reactive({ sessionId: null, messages: [], loading: false, error: null, input: '', sending: false })
+const chat = reactive({ sessionId: null, messages: [], loading: false, error: null, input: '', sending: false, stream: '', toolHint: null })
 const chatScrollEl = ref(null) // 会话列表滚动容器：回复/重载后自动滚到底部（最新一条）
 
 const CHAT_SEND_MODE_KEY = 'oryxos.admin.chatSendMode'
@@ -978,19 +1669,32 @@ async function openAgent(agent) {
   agentBinding.selected = [...(agent.skills || [])]
   agentBinding.error = null
   agentBinding.issues = []
+  agentBinding.saved = false
+  skillFilter.query = ''; skillFilter.showHidden = false // 进入详情编辑页清空筛选态
+  agentKb.selected = []
+  agentKb.error = null
+  agentKb.issues = []
+  agentKb.saved = false
   fileView.value = null
   resetChat()
   resetAgentMemory()
+  loadAgentGovernance(agent.name)
   try {
-    const [treeRes, bindingRes] = await Promise.all([
+    const [treeRes, bindingRes, kbRes] = await Promise.all([
       fetch('/api/v1/workspace/tree'),
       fetch(`/api/v1/agents/${encodeURIComponent(agent.name)}/skills`),
+      fetch(`/api/v1/agents/${encodeURIComponent(agent.name)}/knowledge`),
       loadSkills(), // Skill 绑定选择器的数据源：存在即已安装
+      loadKnowledge(), // 知识库绑定选择器的数据源
     ])
     const body = await treeRes.json()
     const bindingBody = await bindingRes.json()
+    const kbBody = await kbRes.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
     if (bindingBody.code !== 0) throw new Error(bindingBody.message || '绑定加载失败')
+    if (kbBody.code !== 0) throw new Error(kbBody.message || '知识库绑定加载失败')
+    agentKb.selected = (kbBody.data.bindings || []).map((b) => b.name)
+    agentKb.issues = kbBody.data.issues || []
     const agentsNode = (body.data.children || []).find((c) => c.name === 'agents')
     const node = (agentsNode?.children || []).find((c) => c.name === agent.name) || null
     const outputTree = (body.data.children || []).find((c) => c.name === 'output') || null
@@ -1004,7 +1708,7 @@ async function openAgent(agent) {
 
 async function saveAgentBindings() {
   if (!agentDetail.value) return
-  agentBinding.saving = true; agentBinding.error = null
+  agentBinding.saving = true; agentBinding.error = null; agentBinding.saved = false
   try {
     const res = await fetch(`/api/v1/agents/${encodeURIComponent(agentDetail.value.name)}/skills`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -1014,12 +1718,31 @@ async function saveAgentBindings() {
     if (body.code !== 0) throw new Error(body.message || '保存绑定失败')
     agentBinding.selected = (body.data.bindings || []).map((b) => b.name)
     agentBinding.issues = body.data.issues || []
+    agentBinding.saved = true
     agentDetail.value = {
       ...agentDetail.value,
       agent: { ...agentDetail.value.agent, skills: [...agentBinding.selected] },
     }
     await loadAgents()
+    await reloadAgent() // skills/ 软连接已变，刷新文件树
   } catch (e) { agentBinding.error = e.message } finally { agentBinding.saving = false }
+}
+
+async function saveAgentKnowledge() {
+  if (!agentDetail.value) return
+  agentKb.saving = true; agentKb.error = null; agentKb.saved = false
+  try {
+    const res = await fetch(`/api/v1/agents/${encodeURIComponent(agentDetail.value.name)}/knowledge`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ knowledge: agentKb.selected }),
+    })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '保存知识库绑定失败')
+    agentKb.selected = (body.data.bindings || []).map((b) => b.name)
+    agentKb.issues = body.data.issues || []
+    agentKb.saved = true
+    await reloadAgent() // 绑定落成软连接后立即刷新文件树，工作区 tab 不再是旧内容
+  } catch (e) { agentKb.error = e.message } finally { agentKb.saving = false }
 }
 
 // 重新拉取当前 Agent 的元数据 + 文件树（保存文件后刷新基本信息）
@@ -1054,6 +1777,7 @@ function detailTab(tab) {
   agentDetail.value = { ...agentDetail.value, tab }
   if (tab === 'files' || tab === 'output') {
     fileView.value = null // 工作区/输出各自从"未选中"开始，避免跨 tab 串台预览
+    reloadAgent() // 每次进入都重拉文件树：绑定保存/GitOps 外部改动不再显示旧内容
   }
   if (tab === 'chat') {
     loadChat()
@@ -1110,6 +1834,195 @@ async function saveEditBasic() {
   } catch (e) { editError.value = e.message } finally { editSaving.value = false }
 }
 
+// —— 025 人格卡：Agent 详情「基本信息」页的 7 字段人格展示 + 编辑（camelCase 键对 PUT /agents/{name}/persona，落盘 AGENT.md persona 段）——
+const personaEdit = reactive({ open: false, name: '', role: '', traits: '', tone: '', values: '', boundaries: '', sampleStyle: '', saving: false, error: '' })
+function startEditPersona() {
+  const p = (agentDetail.value && agentDetail.value.agent && agentDetail.value.agent.persona) || {}
+  personaEdit.open = true
+  personaEdit.name = p.name || ''
+  personaEdit.role = p.role || ''
+  personaEdit.traits = p.traits || ''
+  personaEdit.tone = p.tone || ''
+  personaEdit.values = p.values || ''
+  personaEdit.boundaries = p.boundaries || ''
+  personaEdit.sampleStyle = p.sampleStyle || ''
+  personaEdit.saving = false
+  personaEdit.error = ''
+}
+function cancelEditPersona() { personaEdit.open = false }
+async function savePersona() {
+  if (!personaEdit.name.trim() || !personaEdit.role.trim()) { personaEdit.error = 'name 与 role 为必填'; return }
+  personaEdit.saving = true; personaEdit.error = ''
+  try {
+    const res = await fetch(`/api/v1/agents/${encodeURIComponent(agentDetail.value.name)}/persona`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: personaEdit.name.trim(), role: personaEdit.role.trim(),
+        traits: personaEdit.traits.trim(), tone: personaEdit.tone.trim(),
+        values: personaEdit.values.trim(), boundaries: personaEdit.boundaries.trim(),
+        sampleStyle: personaEdit.sampleStyle.trim(),
+      }),
+    })
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '保存失败')
+    personaEdit.open = false
+    await reloadAgent()
+  } catch (e) { personaEdit.error = e.message } finally { personaEdit.saving = false }
+}
+
+// —— 041 / #504：GOVERNANCE.yml 面板（agents / skills / knowledge 共用 helpers）——
+const governanceEdit = reactive(createGovernanceEdit())
+const skillGovernance = reactive(createGovernanceEdit())
+const kbGovernance = reactive(createGovernanceEdit())
+function loadAgentGovernance(name) {
+  return loadGovernance(governanceEdit, 'agents', name)
+}
+function startEditGovernance() {
+  beginGovEdit(governanceEdit)
+}
+function cancelEditGovernance() {
+  return abortGovEdit(governanceEdit, 'agents', agentDetail.value?.name)
+}
+function saveGovernance() {
+  return persistGovernance(governanceEdit, 'agents', agentDetail.value?.name)
+}
+function loadSkillGovernance(name) {
+  return loadGovernance(skillGovernance, 'skills', name)
+}
+function startEditSkillGovernance() {
+  beginGovEdit(skillGovernance)
+}
+function cancelEditSkillGovernance() {
+  return abortGovEdit(skillGovernance, 'skills', skillDetail.value?.name)
+}
+function saveSkillGovernance() {
+  return persistGovernance(skillGovernance, 'skills', skillDetail.value?.name)
+}
+function loadKbGovernance(name) {
+  return loadGovernance(kbGovernance, 'knowledge', name)
+}
+function startEditKbGovernance() {
+  beginGovEdit(kbGovernance)
+}
+function cancelEditKbGovernance() {
+  return abortGovEdit(kbGovernance, 'knowledge', kbDetail.value?.name)
+}
+function saveKbGovernance() {
+  return persistGovernance(kbGovernance, 'knowledge', kbDetail.value?.name)
+}
+
+// —— 041 / #504：入站渠道列表 + channels.yaml governance 面板 ——
+const inboundChannels = ref({ loading: false, error: null, data: [] })
+const inboundChannelDetail = ref(null) // { name, type, agent, enabled, loading, error }
+const channelGovernance = reactive({
+  open: false,
+  loading: false,
+  saving: false,
+  error: '',
+  owner: '',
+  version: '',
+  visibility: '',
+  riskLevel: '',
+  health: '',
+  loaded: false,
+})
+async function loadInboundChannels() {
+  inboundChannels.value = { loading: true, error: null, data: [] }
+  try {
+    const res = await fetch('/api/v1/channels')
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    inboundChannels.value = { loading: false, error: null, data: body.data || [] }
+  } catch (e) {
+    inboundChannels.value = { loading: false, error: e.message, data: [] }
+  }
+}
+function closeInboundChannelDetail() {
+  inboundChannelDetail.value = null
+  channelGovernance.open = false
+  channelGovernance.loaded = false
+}
+async function openInboundChannelDetail(nameOrRow) {
+  const name = typeof nameOrRow === 'string' ? nameOrRow : nameOrRow?.name
+  if (!name) return
+  const row = inboundChannels.value.data.find((c) => c.name === name) || nameOrRow
+  inboundChannelDetail.value = {
+    name,
+    type: row?.type || '—',
+    agent: row?.agent || '—',
+    enabled: row?.enabled !== false,
+    loading: false,
+    error: null,
+  }
+  await loadChannelGovernance(name)
+}
+async function loadChannelGovernance(name) {
+  channelGovernance.loading = true
+  channelGovernance.error = ''
+  channelGovernance.open = false
+  channelGovernance.loaded = false
+  try {
+    const res = await fetch(`/api/v1/channels/${encodeURIComponent(name)}/governance`)
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '治理加载失败')
+    const g = body.data || {}
+    channelGovernance.owner = g.owner || ''
+    channelGovernance.version = g.version || ''
+    channelGovernance.visibility = g.visibility || ''
+    channelGovernance.riskLevel = g.riskLevel || ''
+    channelGovernance.health = g.health || ''
+    channelGovernance.loaded = true
+  } catch (e) {
+    channelGovernance.error = e.message
+  } finally {
+    channelGovernance.loading = false
+  }
+}
+function startEditChannelGovernance() {
+  channelGovernance.open = true
+  channelGovernance.error = ''
+  channelGovernance.saving = false
+}
+async function cancelEditChannelGovernance() {
+  channelGovernance.open = false
+  if (inboundChannelDetail.value?.name) await loadChannelGovernance(inboundChannelDetail.value.name)
+}
+async function saveChannelGovernance() {
+  if (!inboundChannelDetail.value) return
+  channelGovernance.saving = true
+  channelGovernance.error = ''
+  try {
+    const res = await fetch(
+      `/api/v1/channels/${encodeURIComponent(inboundChannelDetail.value.name)}/governance`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          owner: channelGovernance.owner.trim() || null,
+          version: channelGovernance.version.trim() || null,
+          visibility: channelGovernance.visibility.trim() || null,
+          riskLevel: channelGovernance.riskLevel.trim() || null,
+          health: channelGovernance.health.trim() || null,
+        }),
+      },
+    )
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '保存失败')
+    const g = body.data || {}
+    channelGovernance.owner = g.owner || ''
+    channelGovernance.version = g.version || ''
+    channelGovernance.visibility = g.visibility || ''
+    channelGovernance.riskLevel = g.riskLevel || ''
+    channelGovernance.health = g.health || ''
+    channelGovernance.open = false
+    channelGovernance.loaded = true
+  } catch (e) {
+    channelGovernance.error = e.message
+  } finally {
+    channelGovernance.saving = false
+  }
+}
+
 // —— 执行历史 tab：该 Agent 每次触发的起止时间 / 状态 / 时长（手动 + 定时）——
 const execHistory = reactive({ loading: false, error: null, data: [] })
 async function loadExecutions() {
@@ -1131,10 +2044,17 @@ function fmtDuration(ms) {
   if (ms == null) return '—'
   if (ms < 1000) return ms + ' ms'
   const s = ms / 1000
-  return s < 60 ? s.toFixed(1) + ' s' : Math.floor(s / 60) + ' 分 ' + Math.round(s % 60) + ' 秒'
+  return s < 60 ? s.toFixed(2) + ' s' : Math.floor(s / 60) + ' 分 ' + Math.round(s % 60) + ' 秒'
 }
 function execStatusLabel(s) {
-  return { RUNNING: '运行中', SUCCESS: '成功', FAILED: '失败' }[s] || s
+  return {
+    QUEUED: '正在启动',
+    RUNNING: '运行中',
+    CANCELLING: '正在停止',
+    SUCCESS: '成功',
+    FAILED: '失败',
+    CANCELLED: '已取消',
+  }[s] || s
 }
 
 // —— Tab 4：会话 —— 每个 Agent 一个固定 session，直接作为对话展示
@@ -1145,11 +2065,14 @@ function resetChat() {
   chat.error = null
   chat.input = ''
   chat.sending = false
+  chat.stream = ''
+  chat.toolHint = null
 }
 
-// 会话列表自动滚到底部：新消息到达/历史重载后，把 .chat 容器推到最新一条。
+// 会话列表按需滚到底部：刷新前仍在底部附近才继续跟随，用户上翻历史时保留阅读位置。
 // nextTick 确保 chatTurns 渲染完再读 scrollHeight，否则还是旧值、滚不到底。
-function scrollChatToBottom() {
+function scrollChatToBottom(shouldScroll) {
+  if (!shouldScroll) return
   nextTick(() => {
     const el = chatScrollEl.value
     if (el) el.scrollTop = el.scrollHeight
@@ -1157,6 +2080,7 @@ function scrollChatToBottom() {
 }
 
 async function loadChat() {
+  const shouldScroll = isNearBottom(chatScrollEl.value)
   chat.loading = true; chat.error = null
   try {
     const name = agentDetail.value.name
@@ -1166,23 +2090,60 @@ async function loadChat() {
     chat.sessionId = body.data.sessionId
     chat.messages = body.data.messages || []
   } catch (e) { chat.error = e.message } finally { chat.loading = false }
-  scrollChatToBottom() // 初次进会话看历史、发消息后重载 都走这里，一次覆盖
+  scrollChatToBottom(shouldScroll)
+}
+
+// 019：解析 SSE 行协议（event/data 对，注释行心跳忽略）——EventSource 不支持 POST，手工读 ReadableStream
+async function readSse(res, onEvent) {
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const frame = buf.slice(0, idx); buf = buf.slice(idx + 2)
+      let event = 'message', data = ''
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim()
+        else if (line.startsWith('data:')) data += line.slice(5).trim()
+        // 以 ":" 开头的注释行（心跳）直接忽略
+      }
+      if (data) onEvent(event, JSON.parse(data))
+    }
+  }
 }
 
 async function sendChat() {
   if (chat.sending || !chat.input.trim()) return
-  chat.sending = true; chat.error = null
+  chat.sending = true; chat.error = null; chat.stream = ''; chat.toolHint = null
   try {
     const name = agentDetail.value.name
     const res = await fetch(`/api/v1/agents/${encodeURIComponent(name)}/session/messages`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
       body: JSON.stringify({ content: chat.input }),
     })
-    const body = await res.json()
-    if (body.code !== 0) throw new Error(body.message || '发送失败')
+    const type = res.headers.get('Content-Type') || ''
+    if (!type.includes('text/event-stream')) {
+      // 流开始前的失败（404/400/401）或非流式兜底：沿用原 JSON 路径
+      const body = await res.json()
+      if (body.code !== 0) throw new Error(body.message || '发送失败')
+    } else {
+      let failed = null
+      await readSse(res, (event, data) => {
+        if (event === 'token') { chat.stream += data.delta; scrollChatToBottom(true) }
+        else if (event === 'tool_start') chat.toolHint = data.name
+        else if (event === 'tool_end') chat.toolHint = null
+        else if (event === 'error') failed = data.message || '处理失败'
+      })
+      if (failed) throw new Error(failed)
+    }
     chat.input = ''
     await loadChat()
-  } catch (e) { chat.error = e.message } finally { chat.sending = false }
+  } catch (e) { chat.error = e.message } finally { chat.sending = false; chat.stream = ''; chat.toolHint = null }
 }
 
 // —— Tab 5：记忆 —— 这个 Agent 自己的长期记忆（只读）
@@ -1379,13 +2340,184 @@ const outputRows = computed(() =>
         </template>
 
         <template v-else>
-          <div class="page-head">
+          <div v-if="!(active === 'runs' && selectedRunId)" class="page-head">
             <h2>{{ current.label }}</h2>
             <button class="btn" @click="refresh()">刷新</button>
           </div>
 
+          <div v-if="active === 'runs'">
+            <RunManagementView
+              ref="runViewRef"
+              :selected-id="selectedRunId"
+              @open="openRunWorkbench"
+              @close="closeRunWorkbench"
+              @go-agents="select('agents')"
+            />
+          </div>
+
+          <!-- 报表（016 审计看板）：KPI 汇总 + 分布条形图 + 明细下钻；时间窗三档 -->
+          <div v-if="active === 'report'">
+            <div class="md-toggle" style="margin-bottom:14px">
+              <button v-for="r in ['7d','30d','all']" :key="r" :class="['md-seg', { on: report.range === r }]" @click="loadReport(r)">{{ r === '7d' ? '近 7 天' : r === '30d' ? '近 30 天' : '全部' }}</button>
+            </div>
+            <!-- Trace 时间线（021）：按 trace ID 查单轮全链路——v0.3 Demo「触发 → 拿 traceId → 查完整链路与成本」 -->
+            <div style="display:flex;gap:8px;margin-bottom:14px">
+              <input class="mono" v-model="trace.id" placeholder="输入 trace ID 回放单轮全链路（响应/SSE/执行历史里都有）" style="flex:1" @keyup.enter="loadTrace()" />
+              <button class="btn btn-primary" @click="loadTrace()">查询链路</button>
+            </div>
+            <p v-if="trace.loading" class="empty">链路查询中…</p>
+            <p v-else-if="trace.error" class="error">出错：{{ trace.error }}</p>
+            <template v-else-if="trace.result">
+              <p v-if="!trace.result.found" class="empty">未找到 trace「{{ trace.result.traceId }}」的审计记录</p>
+              <template v-else>
+                <div class="sess-meta mono" style="margin-bottom:8px">
+                  步骤 {{ trace.result.summary.steps }} · LLM {{ trace.result.summary.llmCalls }} 次 · 工具 {{ trace.result.summary.toolCalls }} 次
+                  · token {{ trace.result.summary.totalTokens }} · 成本 {{ fmtCost(trace.result.summary.costMicros) }}
+                  · 总耗时 {{ fmtDuration(trace.result.summary.totalDurationMs) }}
+                </div>
+                <table style="margin-bottom:18px">
+                  <thead><tr><th>#</th><th>类型</th><th>名称</th><th>结果</th><th>耗时</th><th>时间</th><th>token / 摘要（已脱敏）</th></tr></thead>
+                  <tbody>
+                    <tr v-for="s in trace.result.steps" :key="s.seq">
+                      <td class="mono">{{ s.seq }}</td>
+                      <td><span class="tag">{{ s.type }}</span></td>
+                      <td class="mono">{{ s.name }}</td>
+                      <td><span :class="['tag', s.success ? 'ok' : 'off']">{{ s.success ? '成功' : (s.blockedBy === 'policy' ? '策略拦截' : '失败') }}</span></td>
+                      <td class="mono">{{ fmtDuration(s.durationMs) }}</td>
+                      <td class="mono">{{ fmtTime(s.at) }}</td>
+                      <td class="mono" style="max-width:380px;overflow-wrap:anywhere">
+                        <template v-if="s.type === 'LLM'">{{ s.totalTokens != null ? 'token ' + s.totalTokens : '—' }}{{ s.costMicros != null ? ' · ' + fmtCost(s.costMicros) : '' }}</template>
+                        <template v-else>{{ s.inputSummary || '' }}<span v-if="s.errorMessage" class="error"> · {{ s.errorMessage }}</span></template>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </template>
+            </template>
+            <p v-if="report.loading" class="empty">加载中…</p>
+            <p v-else-if="report.error" class="error">出错：{{ report.error }}</p>
+            <template v-else>
+              <div class="cards">
+                <div class="card"><div class="card-val">{{ report.llm?.count ?? '—' }}</div><div class="card-label">LLM 调用</div><div class="card-hint">总次数</div></div>
+                <div class="card"><div class="card-val">{{ fmtCost(report.llm?.totalCostMicros) }}</div><div class="card-label">总成本</div><div class="card-hint">已计量调用</div></div>
+                <div class="card"><div class="card-val">{{ fmtRate(report.llm?.successRate) }}</div><div class="card-label">LLM 成功率</div><div class="card-hint">成功 / 总数</div></div>
+                <div class="card"><div class="card-val">{{ report.llm ? fmtDuration(report.llm.avgDurationMs) : '—' }}</div><div class="card-label">LLM 平均耗时</div><div class="card-hint">单次调用</div></div>
+                <div class="card"><div class="card-val">{{ report.tool?.count ?? '—' }}</div><div class="card-label">工具调用</div><div class="card-hint">总次数</div></div>
+                <div class="card"><div class="card-val">{{ fmtRate(report.tool?.successRate) }}</div><div class="card-label">工具成功率</div><div class="card-hint">成功 / 总数</div></div>
+              </div>
+
+              <h3 class="sec">模型分布</h3>
+              <div v-if="report.byModel.length" class="bars">
+                <div v-for="m in report.byModel" :key="m.key"
+                     :class="['bar-row', 'clickable', { on: reportFilter?.type === 'model' && reportFilter?.key === m.key }]"
+                     @click="setReportFilter('model', m.key)">
+                  <div class="bar-label mono">{{ m.key }}</div>
+                  <div class="bar-track"><div class="bar-fill" :style="{ width: barWidth(report.byModel, m.count) }"></div></div>
+                  <div class="bar-val mono">{{ m.count }} · {{ fmtCost(m.totalCostMicros) }}</div>
+                </div>
+              </div>
+              <p v-else class="empty">（暂无数据）</p>
+
+              <h3 class="sec">工具分布</h3>
+              <div v-if="report.byTool.length" class="bars">
+                <div v-for="m in report.byTool" :key="m.key"
+                     :class="['bar-row', 'clickable', { on: reportFilter?.type === 'tool' && reportFilter?.key === m.key }]"
+                     @click="setReportFilter('tool', m.key)">
+                  <div class="bar-label mono">{{ m.key }}</div>
+                  <div class="bar-track"><div class="bar-fill" :style="{ width: barWidth(report.byTool, m.count) }"></div></div>
+                  <div class="bar-val mono">{{ m.count }}</div>
+                </div>
+              </div>
+              <p v-else class="empty">（暂无数据）</p>
+
+              <h3 class="sec">Agent 分布</h3>
+              <div v-if="report.byAgent.length" class="bars">
+                <div v-for="m in report.byAgent" :key="m.key"
+                     :class="['bar-row', 'clickable', { on: reportFilter?.type === 'agent' && reportFilter?.key === m.key }]"
+                     @click="setReportFilter('agent', m.key)">
+                  <div class="bar-label mono">{{ m.key }}</div>
+                  <div class="bar-track"><div class="bar-fill" :style="{ width: barWidth(report.byAgent, m.count) }"></div></div>
+                  <div class="bar-val mono">{{ m.count }} · {{ fmtCost(m.totalCostMicros) }}</div>
+                </div>
+              </div>
+              <p v-else class="empty">（暂无数据）</p>
+
+              <div v-if="reportFilter" class="filter-bar">
+                <span>已过滤：<b>{{ reportFilter.key }}</b>（{{ reportFilter.type === 'model' ? '模型' : reportFilter.type === 'tool' ? '工具' : 'Agent' }}）</span>
+                <button class="btn" @click="clearReportFilter">✕ 清除过滤</button>
+              </div>
+
+              <h3 class="sec clickable" @click="reportExpand.llm = !reportExpand.llm">
+                LLM 调用明细 <span class="mono">{{ reportExpand.llm ? '▾' : '▸' }}</span>
+              </h3>
+              <template v-if="reportExpand.llm">
+                <table>
+                  <thead><tr><th>时间</th><th>Agent</th><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>总</th><th>成本</th><th>耗时</th><th>结果</th><th>Trace</th></tr></thead>
+                  <tbody>
+                    <tr v-if="!pagedLlmList.length"><td colspan="11" class="empty">（暂无数据）</td></tr>
+                    <tr v-for="c in pagedLlmList" :key="c.id">
+                      <td class="mono">{{ fmtTime(c.createdAt) }}</td>
+                      <td>{{ c.profileName || '—' }}</td>
+                      <td>{{ c.provider }}</td>
+                      <td class="mono">{{ c.model }}</td>
+                      <td class="mono">{{ c.promptTokens ?? '—' }}</td>
+                      <td class="mono">{{ c.completionTokens ?? '—' }}</td>
+                      <td class="mono">{{ c.totalTokens ?? '—' }}</td>
+                      <td class="mono">{{ fmtCost(c.costMicros) }}</td>
+                      <td class="mono">{{ fmtDuration(c.durationMs) }}</td>
+                      <td><span :class="['tag', c.success ? 'ok' : 'off']">{{ c.success ? '成功' : '失败' }}</span></td>
+                      <td class="mono trace-cell"><a v-if="c.traceId" href="#" title="点击回放该轮时间线" @click.prevent="loadTrace(c.traceId)">{{ c.traceId }}</a><template v-else>—</template></td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="pager">
+                  <span class="mono">共 {{ filteredLlmList.length }} 条</span>
+                  <select v-model.number="llmPage.size">
+                    <option :value="10">10 条/页</option>
+                    <option :value="20">20 条/页</option>
+                    <option :value="50">50 条/页</option>
+                  </select>
+                  <button class="btn" :disabled="llmPage.page <= 1" @click="llmPage.page--">上一页</button>
+                  <span class="mono">{{ llmPage.page }} / {{ totalLlmPages }}</span>
+                  <button class="btn" :disabled="llmPage.page >= totalLlmPages" @click="llmPage.page++">下一页</button>
+                </div>
+              </template>
+
+              <h3 class="sec clickable" @click="reportExpand.tool = !reportExpand.tool">
+                工具调用明细 <span class="mono">{{ reportExpand.tool ? '▾' : '▸' }}</span>
+              </h3>
+              <template v-if="reportExpand.tool">
+                <table>
+                  <thead><tr><th>时间</th><th>Agent</th><th>工具</th><th>耗时</th><th>结果</th><th>Trace</th></tr></thead>
+                  <tbody>
+                    <tr v-if="!pagedToolList.length"><td colspan="6" class="empty">（暂无数据）</td></tr>
+                    <tr v-for="t in pagedToolList" :key="t.id">
+                      <td class="mono">{{ fmtTime(t.createdAt) }}</td>
+                      <td>{{ t.profileName || '—' }}</td>
+                      <td class="mono">{{ t.toolName }}</td>
+                      <td class="mono">{{ fmtDuration(t.durationMs) }}</td>
+                      <td><span :class="['tag', t.success ? 'ok' : 'off']">{{ t.success ? '成功' : '失败' }}</span></td>
+                      <td class="mono trace-cell"><a v-if="t.traceId" href="#" title="点击回放该轮时间线" @click.prevent="loadTrace(t.traceId)">{{ t.traceId }}</a><template v-else>—</template></td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="pager">
+                  <span class="mono">共 {{ filteredToolList.length }} 条</span>
+                  <select v-model.number="toolPage.size">
+                    <option :value="10">10 条/页</option>
+                    <option :value="20">20 条/页</option>
+                    <option :value="50">50 条/页</option>
+                  </select>
+                  <button class="btn" :disabled="toolPage.page <= 1" @click="toolPage.page--">上一页</button>
+                  <span class="mono">{{ toolPage.page }} / {{ totalToolPages }}</span>
+                  <button class="btn" :disabled="toolPage.page >= totalToolPages" @click="toolPage.page++">下一页</button>
+                </div>
+              </template>
+            </template>
+          </div>
+
           <!-- Skill：纯 CRUD 列表（存在即已安装）；绑定一致性仅在变更后回检发现问题时展示 -->
-          <div v-if="active === 'skills'">
+          <div v-else-if="active === 'skills'">
             <template v-if="!skillDetail">
             <div class="toolbar">
               <button class="btn" @click="newImport()">从 GitHub 拉取</button>
@@ -1474,6 +2606,51 @@ const outputRows = computed(() =>
               <button class="btn back" @click="closeSkillDetail">← 返回 Skill 列表</button>
               <div class="sess-meta"><span>Skill</span><span class="mono">{{ skillDetail.name }}</span></div>
               <p class="empty">{{ skillDetail.description || '—' }}</p>
+              <!-- 041 / #504：Skill GOVERNANCE.yml -->
+              <div style="margin:12px 0 16px">
+                <div class="sess-meta"><span>治理</span>
+                  <button v-if="!skillGovernance.open && skillGovernance.loaded" class="btn" @click="startEditSkillGovernance">编辑治理</button>
+                </div>
+                <p v-if="skillGovernance.loading" class="empty">加载治理…</p>
+                <p v-else-if="skillGovernance.error && !skillGovernance.open" class="error">{{ skillGovernance.error }}</p>
+                <template v-else-if="skillGovernance.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">health</label>
+                      <select v-model="skillGovernance.health" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="DEPRECATED">DEPRECATED</option>
+                        <option value="OFFLINE">OFFLINE</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">owner</label><input v-model="skillGovernance.owner" class="gen-input" placeholder="属主用户名（可选）" /></div>
+                    <div class="info-row edit"><label class="k">visibility</label>
+                      <select v-model="skillGovernance.visibility" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="PRIVATE">PRIVATE</option>
+                        <option value="WORKSPACE">WORKSPACE</option>
+                        <option value="PUBLIC">PUBLIC</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">version</label><input v-model="skillGovernance.version" class="gen-input" placeholder="版本（展示/审计）" /></div>
+                    <div class="info-row edit"><label class="k">riskLevel</label><input v-model="skillGovernance.riskLevel" class="gen-input" placeholder="风险等级（展示）" /></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="skillGovernance.saving" @click="saveSkillGovernance">保存</button>
+                      <button class="btn" :disabled="skillGovernance.saving" @click="cancelEditSkillGovernance">取消</button>
+                      <span v-if="skillGovernance.saving" class="empty">保存中…</span>
+                      <span v-if="skillGovernance.error" class="error">{{ skillGovernance.error }}</span>
+                    </div>
+                    <p class="empty">写入 Skill 目录 GOVERNANCE.yml。OFFLINE 时（需开启 rbac + asset-governance）不可绑定/调用；PRIVATE 仅属主/ADMIN 可管。空值表示未设治理。</p>
+                  </div>
+                </template>
+                <div v-else-if="skillGovernance.loaded" class="info-grid">
+                  <div class="info-row"><span class="k">health</span><span class="mono">{{ blankGov(skillGovernance.health) }}</span></div>
+                  <div class="info-row"><span class="k">owner</span><span>{{ blankGov(skillGovernance.owner) }}</span></div>
+                  <div class="info-row"><span class="k">visibility</span><span class="mono">{{ blankGov(skillGovernance.visibility) }}</span></div>
+                  <div class="info-row"><span class="k">version</span><span>{{ blankGov(skillGovernance.version) }}</span></div>
+                  <div class="info-row"><span class="k">riskLevel</span><span>{{ blankGov(skillGovernance.riskLevel) }}</span></div>
+                </div>
+              </div>
               <p v-if="skillDetail.loading" class="empty">加载中…</p>
               <p v-else-if="skillDetail.error" class="error">出错：{{ skillDetail.error }}</p>
               <!-- 有真实目录子树 → 文件浏览器 -->
@@ -1514,13 +2691,165 @@ const outputRows = computed(() =>
             </div>
           </div>
 
-          <!-- 知识库：占位空列表（待接入知识库端点） -->
-          <table v-else-if="active === 'knowledge'">
-            <thead><tr><th>名称</th><th>描述</th></tr></thead>
-            <tbody><tr><td colspan="2" class="empty">（暂无知识库条目 · 待接入知识库端点）</td></tr></tbody>
-          </table>
+          <!-- 知识库（014）：列表 + 详情（文档清单/上传/重建/单文档删除）；管理操作按后端能力集渲染 -->
+          <div v-else-if="active === 'knowledge'">
+            <!-- 列表视图 -->
+            <template v-if="!kbDetail">
+              <div class="toolbar">
+                <button class="btn btn-primary" @click="kbForm.open = true">+ 新建知识库</button>
+              </div>
+              <div v-if="kbForm.open" class="modal-overlay" @click.self="cancelKb()">
+                <div class="modal-card">
+                  <div class="modal-head"><h3>新建知识库</h3><button class="modal-x" @click="cancelKb()">✕</button></div>
+                  <div class="modal-body">
+                    <input v-model="kbForm.name" class="gen-input" placeholder="库名（字母/数字/下划线/连字符，即目录名）" />
+                    <textarea v-model="kbForm.description" class="gen-input" rows="2" placeholder="描述（会注入 Agent 上下文，写清这库装什么知识）"></textarea>
+                    <p v-if="kbForm.error" class="error">{{ kbForm.error }}</p>
+                  </div>
+                  <div class="modal-foot">
+                    <button class="btn" @click="cancelKb">取消</button>
+                    <button class="btn btn-primary" :disabled="kbForm.busy || !kbForm.name.trim() || !kbForm.description.trim()" @click="createKb">创建</button>
+                  </div>
+                </div>
+              </div>
+              <p v-if="kb.loading" class="empty">加载中…</p>
+              <p v-else-if="kb.error" class="error">出错：{{ kb.error }}</p>
+              <table v-else>
+                <thead><tr><th>名称</th><th>描述</th><th>后端</th><th>文档数</th><th>片段数</th><th>索引状态</th><th style="width:160px">操作</th></tr></thead>
+                <tbody>
+                  <tr v-if="!kb.data.length"><td colspan="7" class="empty">（暂无知识库，点右上「新建知识库」或向 .oryxos/knowledge/ 放入目录）</td></tr>
+                  <tr v-for="b in kb.data" :key="b.name">
+                    <td class="mono">{{ b.name }}</td>
+                    <td>{{ b.description }}</td>
+                    <td class="mono">{{ b.backend }}</td>
+                    <td>{{ b.documentCount }}</td>
+                    <td>{{ b.chunkCount }}</td>
+                    <td>{{ b.indexStatus }}</td>
+                    <td class="ops">
+                      <button class="btn" @click="refreshKbDetail(b.name)">详情</button>
+                      <button v-if="b.capabilities?.createDelete" class="btn" @click="deleteKb(b.name)">删除</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+            <!-- 详情视图：文档清单 + 上传 + 重建（能力感知：只读后端不出上传/重建入口，FR-009） -->
+            <div v-else>
+              <button class="btn back" @click="closeKbDetail">← 返回知识库列表</button>
+              <div class="sess-meta"><span>知识库</span><span class="mono">{{ kbDetail.name }}</span></div>
+              <!-- 041 / #504：Knowledge GOVERNANCE.yml -->
+              <div style="margin:12px 0 16px">
+                <div class="sess-meta"><span>治理</span>
+                  <button v-if="!kbGovernance.open && kbGovernance.loaded" class="btn" @click="startEditKbGovernance">编辑治理</button>
+                </div>
+                <p v-if="kbGovernance.loading" class="empty">加载治理…</p>
+                <p v-else-if="kbGovernance.error && !kbGovernance.open" class="error">{{ kbGovernance.error }}</p>
+                <template v-else-if="kbGovernance.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">health</label>
+                      <select v-model="kbGovernance.health" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="DEPRECATED">DEPRECATED</option>
+                        <option value="OFFLINE">OFFLINE</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">owner</label><input v-model="kbGovernance.owner" class="gen-input" placeholder="属主用户名（可选）" /></div>
+                    <div class="info-row edit"><label class="k">visibility</label>
+                      <select v-model="kbGovernance.visibility" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="PRIVATE">PRIVATE</option>
+                        <option value="WORKSPACE">WORKSPACE</option>
+                        <option value="PUBLIC">PUBLIC</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">version</label><input v-model="kbGovernance.version" class="gen-input" placeholder="版本（展示/审计）" /></div>
+                    <div class="info-row edit"><label class="k">riskLevel</label><input v-model="kbGovernance.riskLevel" class="gen-input" placeholder="风险等级（展示）" /></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="kbGovernance.saving" @click="saveKbGovernance">保存</button>
+                      <button class="btn" :disabled="kbGovernance.saving" @click="cancelEditKbGovernance">取消</button>
+                      <span v-if="kbGovernance.saving" class="empty">保存中…</span>
+                      <span v-if="kbGovernance.error" class="error">{{ kbGovernance.error }}</span>
+                    </div>
+                    <p class="empty">写入知识库目录 GOVERNANCE.yml。OFFLINE 时（需开启 rbac + asset-governance）不可检索/绑定；PRIVATE 仅属主/ADMIN 可管。空值表示未设治理。</p>
+                  </div>
+                </template>
+                <div v-else-if="kbGovernance.loaded" class="info-grid">
+                  <div class="info-row"><span class="k">health</span><span class="mono">{{ blankGov(kbGovernance.health) }}</span></div>
+                  <div class="info-row"><span class="k">owner</span><span>{{ blankGov(kbGovernance.owner) }}</span></div>
+                  <div class="info-row"><span class="k">visibility</span><span class="mono">{{ blankGov(kbGovernance.visibility) }}</span></div>
+                  <div class="info-row"><span class="k">version</span><span>{{ blankGov(kbGovernance.version) }}</span></div>
+                  <div class="info-row"><span class="k">riskLevel</span><span>{{ blankGov(kbGovernance.riskLevel) }}</span></div>
+                </div>
+              </div>
+              <p v-if="kbDetail.loading" class="empty">加载中…</p>
+              <template v-else>
+                <p class="empty">{{ kbDetail.base?.description || '—' }}（后端：{{ kbDetail.base?.backend || '—' }} · 状态：{{ kbDetail.base?.indexStatus || '—' }} · 片段 {{ kbDetail.base?.chunkCount ?? '—' }}）</p>
+                <div class="ops" style="margin:8px 0">
+                  <label v-if="kbDetail.base?.capabilities?.importDocs" class="btn" style="cursor:pointer">
+                    上传文档（md / txt / 文本型 PDF）
+                    <input type="file" accept=".md,.markdown,.txt,.pdf" style="display:none" @change="uploadKbDoc" />
+                  </label>
+                  <button v-if="kbDetail.base?.capabilities?.rebuild" class="btn" :disabled="kbDetail.busy" @click="reindexKb">重建索引</button>
+                  <button class="btn" :disabled="kbDetail.busy" @click="refreshKbDetail(kbDetail.name)">刷新状态</button>
+                </div>
+                <p v-if="kbDetail.busy" class="empty">处理中…（切分向量化在后台推进，可点「刷新状态」跟进）</p>
+                <p v-if="kbDetail.error" class="error">{{ kbDetail.error }}</p>
+                <table>
+                  <thead><tr><th>文档</th><th>状态</th><th>片段数</th><th>最近索引</th><th style="width:90px">操作</th></tr></thead>
+                  <tbody>
+                    <tr v-if="!kbDetail.documents.length"><td colspan="5" class="empty">（暂无文档）</td></tr>
+                    <tr v-for="d in kbDetail.documents" :key="d.relPath">
+                      <td class="mono">{{ d.relPath }}</td>
+                      <td>{{ d.state }}<span v-if="d.failureReason" class="error">：{{ d.failureReason }}</span></td>
+                      <td>{{ d.chunkCount }}</td>
+                      <td class="mono">{{ d.indexedAt ? new Date(d.indexedAt).toLocaleString() : '—' }}</td>
+                      <td class="ops"><button v-if="kbDetail.base?.capabilities?.importDocs" class="btn" @click="deleteKbDoc(d.relPath)">删除</button></td>
+                    </tr>
+                  </tbody>
+                </table>
 
-          <!-- Sandbox 白名单：三类 file/shell/http 的 CRUD（新增走弹框 / 逐行删除） -->
+                <!-- 使用看板（FR-023）：只消费审计数据聚合，指标可与审计记录核对（SC-009） -->
+                <h3 class="sec" style="margin-top:20px">使用看板</h3>
+                <div class="md-toggle" style="margin-bottom:8px">
+                  <button :class="['md-seg', { on: kbMetrics.range === '7d' }]" @click="loadKbMetrics('7d')">近 7 天</button>
+                  <button :class="['md-seg', { on: kbMetrics.range === '30d' }]" @click="loadKbMetrics('30d')">近 30 天</button>
+                  <button :class="['md-seg', { on: kbMetrics.range === 'all' }]" @click="loadKbMetrics('all')">全部</button>
+                </div>
+                <p v-if="kbMetrics.loading" class="empty">加载中…</p>
+                <p v-else-if="kbMetrics.error" class="error">看板加载失败：{{ kbMetrics.error }}</p>
+                <template v-else-if="kbMetrics.data">
+                  <p class="empty">
+                    检索 <b>{{ kbMetrics.data.retrievalCount }}</b> 次 ·
+                    零结果率 <b>{{ fmtRate(kbMetrics.data.zeroResultRate) }}</b>（{{ kbMetrics.data.zeroResultCount }} 次）·
+                    降级率 <b>{{ fmtRate(kbMetrics.data.degradedRate) }}</b> ·
+                    出处引用率 <b>{{ fmtRate(kbMetrics.data.citationRate) }}</b>（近似）
+                  </p>
+                  <template v-if="kbMetrics.data.hitDocuments.length">
+                    <p class="empty">命中文档分布：</p>
+                    <table>
+                      <thead><tr><th>文档</th><th style="width:90px">命中次数</th></tr></thead>
+                      <tbody>
+                        <tr v-for="h in kbMetrics.data.hitDocuments" :key="h.relPath">
+                          <td class="mono">{{ h.relPath }}</td><td>{{ h.hits }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </template>
+                  <template v-if="kbMetrics.data.zeroResultQueries.length || kbMetrics.data.unattributedZeroResults">
+                    <p class="empty">零结果查询（判断该补什么文档）：</p>
+                    <ul class="issue-list">
+                      <li v-for="(q, i) in kbMetrics.data.zeroResultQueries" :key="'z'+i" class="mono">{{ q }}</li>
+                      <li v-for="(q, i) in kbMetrics.data.unattributedZeroResultQueries" :key="'u'+i" class="mono">{{ q }}（跨库聚合，未限定本库）</li>
+                    </ul>
+                  </template>
+                  <p v-else-if="!kbMetrics.data.retrievalCount" class="empty">（时间窗内暂无检索记录）</p>
+                </template>
+              </template>
+            </div>
+          </div>
+
+          <!-- Sandbox 白名单：四类 file/shell/http/smtp 的 CRUD（新增走弹框 / 逐行删除） -->
           <div v-else-if="active === 'whitelist'">
             <div class="toolbar">
               <button class="btn btn-primary" @click="wlForm.open = true">+ 新增白名单</button>
@@ -1534,9 +2863,10 @@ const outputRows = computed(() =>
                     <option value="file">文件路径</option>
                     <option value="shell">Shell 命令</option>
                     <option value="http">HTTP 域名</option>
+                    <option value="smtp">SMTP 端点</option>
                   </select>
                   <input v-model="wlForm.value" class="gen-input" :placeholder="wlPlaceholder" />
-                  <p class="empty">选择类别并填写一条白名单条目：文件路径 / Shell 命令首 token / HTTP 域名（支持通配，如 *.example.com）。</p>
+                  <p class="empty">选择类别并填写一条白名单条目：文件路径 / 可执行文件 / HTTP 域名 / SMTP 端点（域名支持通配，如 *.example.com）。</p>
                   <p v-if="wlForm.error" class="error">{{ wlForm.error }}</p>
                 </div>
                 <div class="modal-foot">
@@ -1564,12 +2894,128 @@ const outputRows = computed(() =>
             </template>
           </div>
 
+          <!-- 020：工具策略 —— 规则 CRUD + 每 Agent 有效工具集（含被移除原因）+ 策略拒绝记录 -->
+          <div v-else-if="active === 'tool-policy'">
+            <div class="toolbar">
+              <button class="btn btn-primary" @click="tpForm.open = true">+ 新增策略规则</button>
+            </div>
+            <div v-if="tpForm.open" class="modal-overlay" @click.self="cancelTp()">
+              <div class="modal-card">
+                <div class="modal-head"><h3>新增策略规则</h3><button class="modal-x" @click="cancelTp()">✕</button></div>
+                <div class="modal-body">
+                  <select v-model="tpForm.ruleType" class="gen-input">
+                    <option v-for="t in TP_TYPES" :key="t.key" :value="t.key">{{ t.label }}</option>
+                  </select>
+                  <input v-if="tpNeedAgent" v-model="tpForm.agentName" class="gen-input" placeholder="Agent 名（如 ops-agent）" />
+                  <input v-model="tpForm.pattern" class="gen-input" placeholder="工具名（如 shell）或 MCP 通配（如 github-mcp:*）" />
+                  <p class="empty">策略只做减法：例外仅解除全局禁用，不能授予 Agent 未声明的工具；变更即刻生效（热更新）。</p>
+                  <p v-if="tpForm.error" class="error">{{ tpForm.error }}</p>
+                </div>
+                <div class="modal-foot">
+                  <button class="btn" @click="cancelTp">取消</button>
+                  <button class="btn btn-primary" :disabled="tpForm.busy || !tpForm.pattern.trim() || (tpNeedAgent && !tpForm.agentName.trim())" @click="addToolPolicyRule">新增</button>
+                </div>
+              </div>
+            </div>
+            <p v-if="tp.loading" class="empty">加载中…</p>
+            <p v-else-if="tp.error" class="error">出错：{{ tp.error }}</p>
+            <template v-else>
+              <h3 class="sec" style="margin-top:20px">策略规则</h3>
+              <table>
+                <thead><tr><th>类型</th><th>Agent</th><th>pattern</th><th>来源</th><th>时间</th><th style="width:90px">操作</th></tr></thead>
+                <tbody>
+                  <tr v-if="!tp.rules.length"><td colspan="6" class="empty">（暂无策略规则——零策略时一切行为与现状一致）</td></tr>
+                  <tr v-for="r in tp.rules" :key="r.id">
+                    <td>{{ tpTypeLabel(r.ruleType) }}</td>
+                    <td class="mono">{{ r.agentName || '（全部）' }}</td>
+                    <td class="mono">{{ r.pattern }}<span v-if="r.unknownTarget" class="error" title="未注册的工具名，可能拼写有误"> ⚠</span></td>
+                    <td class="mono">{{ r.createdBy || '-' }}</td>
+                    <td class="mono">{{ r.createdAt ? String(r.createdAt).slice(0, 19) : '-' }}</td>
+                    <td class="ops"><button class="btn" @click="deleteToolPolicyRule(r)">删除</button></td>
+                  </tr>
+                </tbody>
+              </table>
+              <h3 class="sec" style="margin-top:20px">各 Agent 有效工具集</h3>
+              <table>
+                <thead><tr><th>Agent</th><th>声明</th><th>有效</th><th>被策略移除（原因）</th></tr></thead>
+                <tbody>
+                  <tr v-if="!tp.effective.length"><td colspan="4" class="empty">（暂无 Agent）</td></tr>
+                  <tr v-for="e in tp.effective" :key="e.agentName">
+                    <td class="mono">{{ e.agentName }}</td>
+                    <td class="mono">{{ e.declared.join(', ') || '（无）' }}</td>
+                    <td class="mono">{{ e.effective.join(', ') || '（全空——将以纯对话运行）' }}</td>
+                    <td class="mono">
+                      <template v-if="e.removed.length">
+                        <div v-for="rm in e.removed" :key="rm.toolName">{{ rm.toolName }} — {{ rm.reason }}</div>
+                      </template>
+                      <span v-else class="empty">（无）</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <h3 class="sec" style="margin-top:20px">策略拒绝记录（最近 50 条）</h3>
+              <table>
+                <thead><tr><th>Agent</th><th>工具</th><th>时间</th></tr></thead>
+                <tbody>
+                  <tr v-if="!tp.denied.length"><td colspan="3" class="empty">（暂无策略拒绝的调用）</td></tr>
+                  <tr v-for="d in tp.denied" :key="d.id">
+                    <td class="mono">{{ d.profileName || '-' }}</td>
+                    <td class="mono">{{ d.toolName }}</td>
+                    <td class="mono">{{ d.createdAt ? String(d.createdAt).slice(0, 19) : '-' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+          </div>
+
+          <div v-else-if="active === 'exec-backend'">
+            <div class="toolbar">
+              <button class="btn" @click="loadExecBackend()">刷新（重新探测 daemon）</button>
+            </div>
+            <p v-if="exec.loading" class="empty">加载中…</p>
+            <p v-else-if="exec.error" class="error">出错：{{ exec.error }}</p>
+            <template v-else-if="exec.data">
+              <h3 class="sec" style="margin-top:20px">全局档位</h3>
+              <table>
+                <tbody>
+                  <tr><td>档位</td><td class="mono">{{ exec.data.backend }}</td></tr>
+                  <tr><td>执行镜像</td><td class="mono">{{ exec.data.image || '（local 档未配置）' }}</td></tr>
+                  <tr><td>镜像 digest</td><td class="mono">{{ exec.data.imageDigest || '-' }}</td></tr>
+                  <tr><td>默认限额</td><td class="mono">{{ exec.data.memory }} / {{ exec.data.cpus }} CPU</td></tr>
+                  <tr><td>网络</td><td class="mono">{{ exec.data.network }}</td></tr>
+                  <tr><td>执行用户</td><td class="mono">{{ exec.data.user }}</td></tr>
+                </tbody>
+              </table>
+              <h3 class="sec" style="margin-top:20px">docker 可用性</h3>
+              <p v-if="exec.data.docker.reachable" class="mono">✅ 可达 —— {{ exec.data.docker.version }}</p>
+              <p v-else class="error">⛔ {{ exec.data.docker.error }}（shell 调用将按 FR-011 fail loud 报错）</p>
+              <h3 class="sec" style="margin-top:20px">Agent 覆写一览（frontmatter sandbox 段）</h3>
+              <table>
+                <thead><tr><th>Agent</th><th>backend 覆写</th><th>memory 覆写</th><th>cpus 覆写</th></tr></thead>
+                <tbody>
+                  <tr v-if="!exec.data.agentOverrides.length"><td colspan="4" class="empty">（无 Agent 声明覆写——全部继承全局档）</td></tr>
+                  <tr v-for="o in exec.data.agentOverrides" :key="o.agent">
+                    <td class="mono">{{ o.agent }}</td>
+                    <td class="mono">{{ o.backend || '（继承）' }}</td>
+                    <td class="mono">{{ o.memory || '（继承）' }}</td>
+                    <td class="mono">{{ o.cpus || '（继承）' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+          </div>
+
           <!-- 30 节：Agent —— 一个列表（含新建/删除）；点"详情"进这个 Agent 的文件浏览器 -->
           <div v-else-if="active === 'agents'">
             <!-- 新建视图：独立整页（不是弹框），把「大模型生成」折叠进来 -->
             <div v-if="agentCreate.open">
               <button class="btn back" @click="cancelCreate">← 返回</button>
               <div class="sess-meta"><span>新建 Agent</span></div>
+              <div class="tabs">
+                <button :class="['tab', { on: createMode === 'llm' }]" @click="setCreateMode('llm')">一句话生成</button>
+                <button :class="['tab', { on: createMode === 'import' }]" @click="setCreateMode('import')">从人格库导入</button>
+              </div>
+              <template v-if="createMode === 'llm'">
               <div class="gen-box">
                 <label class="empty" style="display:block;margin-bottom:2px">Agent 名（字母/数字/下划线/连字符，必填）</label>
                 <input v-model="agentCreate.name" class="gen-input" placeholder="例如 pr-digest" />
@@ -1597,13 +3043,35 @@ const outputRows = computed(() =>
                 <label class="empty" style="display:block;margin:6px 0 2px">Skill 绑定（勾选=required；作者可从已安装 Skill 再建议）</label>
                 <div class="skill-picker">
                   <span v-if="!skills.data.length" class="empty">（暂无已安装 Skill，可先到 Skill 页新建或从 GitHub 拉取）</span>
-                  <label v-for="s in skills.data" :key="s.name" class="skill-opt" :title="s.description">
-                    <input type="checkbox" :value="s.name" v-model="agentCreate.skills" />
-                    <span class="mono">{{ s.name }}</span>
-                  </label>
+                  <template v-else>
+                    <input class="gen-input skill-search" v-model="skillFilter.query" placeholder="按名称或描述筛选已安装 Skill" />
+                    <div v-if="createSkillHiddenCount > 0" class="skill-hidden-hint">
+                      <span>当前筛选隐藏了 {{ createSkillHiddenCount }} 项已选</span>
+                      <button type="button" class="btn" @click="skillFilter.showHidden = true" v-if="!skillFilter.showHidden">纳入视野</button>
+                      <button type="button" class="btn" @click="skillFilter.showHidden = false" v-else>恢复筛选</button>
+                    </div>
+                    <div class="skill-batch">
+                      <button type="button" class="btn" @click="agentCreate.skills = selectAllVisible(createSkillVisible, agentCreate.skills)" :disabled="!createSkillVisible.length">全选当前</button>
+                      <button type="button" class="btn" @click="agentCreate.skills = clearVisible(createSkillVisible, agentCreate.skills)" :disabled="!createSkillVisible.length">清空当前</button>
+                    </div>
+                    <label v-for="s in createSkillRender" :key="s.name" class="skill-opt" :class="{ 'skill-hidden': s.hidden }" :title="s.description">
+                      <input type="checkbox" :value="s.name" v-model="agentCreate.skills" />
+                      <span class="mono">{{ s.name }}</span>
+                    </label>
+                    <span v-if="!createSkillRender.length" class="empty">（无匹配 Skill）</span>
+                  </template>
                 </div>
                 <p v-if="agentCreate.suggestedSkills.length" class="empty">作者建议：{{ agentCreate.suggestedSkills.join('、') }}；已合并到最终绑定，可在创建前取消。</p>
                 <p class="empty">绑定保存为 agents/&lt;name&gt;/skills/&lt;skill&gt; 固定相对软连接；AGENT.md 不保存 skills 字段，也不预载正文。</p>
+                <label class="empty" style="display:block;margin:6px 0 2px">知识库绑定（可多选；「用大模型生成」会按需求给出建议）</label>
+                <div class="skill-picker">
+                  <span v-if="!kb.data.length" class="empty">（暂无知识库，可先到「知识库」页新建）</span>
+                  <label v-for="b in kb.data" :key="b.name" class="skill-opt" :title="b.description">
+                    <input type="checkbox" :value="b.name" v-model="agentCreate.knowledge" />
+                    <span class="mono">{{ b.name }}</span>
+                  </label>
+                </div>
+                <p v-if="agentCreate.suggestedKnowledge.length" class="empty">作者建议知识库：{{ agentCreate.suggestedKnowledge.join('、') }}；已合并到选择，可在创建前取消。</p>
                 <div class="ops">
                   <button class="btn" :disabled="agentCreate.busy || !agentCreate.name.trim()" @click="generateFiles">用大模型生成</button>
                   <button class="btn btn-primary" :disabled="agentCreate.busy || !agentCreate.name.trim()" @click="submitCreate">创建</button>
@@ -1617,6 +3085,76 @@ const outputRows = computed(() =>
                   <textarea class="mono filetext" v-model="agentCreate.files[path]"></textarea>
                 </div>
               </template>
+              </template>
+
+              <!-- 从人格库导入（025）：llm 之外的另一种建法。选人格/粘贴源 → import-preview 预览 → import 落盘，成功后直接进详情 -->
+              <div v-else class="gen-box">
+                <label class="empty" style="display:block;margin-bottom:2px">从人格库选（12 个内置 + 你保存的自定义；人格的新建/编辑/删除请到左侧「人格库」页），或上传/粘贴 agency-agents-zh 风格的 .md（身份段会被解析成 persona 7 字段，落盘成 AGENT.md）</label>
+                <div class="skill-picker">
+                  <span v-if="personaPresets.loading" class="empty">加载人格预设…</span>
+                  <span v-else-if="personaPresets.error" class="error">加载失败：{{ personaPresets.error }}</span>
+                  <template v-else>
+                    <button v-for="p in personaPresets.data" :key="p.key"
+                            :class="['preset-opt', { on: agentImport.selected === p.key }]"
+                            :disabled="agentImport.busy"
+                            @click="pickPreset(p)"
+                            :title="p.sourceFile || '自定义人格'">
+                      <span class="preset-emoji">{{ p.emoji }}</span>
+                      <span class="preset-label">{{ p.label }}
+                        <span class="preset-badge" :class="p.builtin ? 'b-in' : 'b-cu'">{{ p.builtin ? '内置' : '自定义' }}</span>
+                      </span>
+                      <span class="empty preset-desc">{{ p.description }}</span>
+                    </button>
+                  </template>
+                </div>
+                <label class="empty" style="display:block;margin:6px 0 2px">或上传 .md 源文件（.md，自动读入下方文本框）</label>
+                <input type="file" accept=".md,text/markdown" class="gen-input" @change="onImportFile" />
+                <label class="empty" style="display:block;margin:6px 0 2px">源文件内容（可粘贴后编辑，改动后重新「预览」）</label>
+                <textarea v-model="agentImport.sourceContent" class="gen-draft" rows="6" placeholder="---&#10;name: …&#10;description: …&#10;---&#10;## 核心使命&#10;…（agency-agents-zh 人格文件；身份段按 角色/个性/性格 行级关键字解析）"></textarea>
+                <label class="empty" style="display:block;margin:6px 0 2px">Agent 名（合法 slug：字母/数字/下划线/连字符；中文 displayName 派生不出合法 slug，默认用预设 key）</label>
+                <input v-model="agentImport.name" class="gen-input" placeholder="例如 product-manager" />
+                <label class="empty" style="display:block;margin:6px 0 2px">模型（可选，缺省落占位，导入后可在基本信息里改）</label>
+                <select v-model="agentImport.provider" class="gen-input" @change="onImportProviderChange">
+                  <option value="">Provider…</option>
+                  <option v-for="p in (createProviders.data || [])" :key="p.name" :value="p.name">{{ p.name }}</option>
+                </select>
+                <select v-if="agentImport.provider" v-model="agentImport.model" class="gen-input" style="margin-top:4px">
+                  <option value="">模型…</option>
+                  <option v-for="m in (createModels.data || [])" :key="m" :value="m">{{ m }}</option>
+                </select>
+                <p v-if="createProviders.loading" class="empty">加载 Provider 列表…</p>
+                <p v-else-if="createProviders.error" class="error">Provider 列表加载失败：{{ createProviders.error }}</p>
+                <p v-else-if="agentImport.provider && createModels.loading" class="empty">加载模型列表…</p>
+                <p v-else-if="agentImport.provider && createModels.error" class="error">模型列表加载失败：{{ createModels.error }}</p>
+                <div class="ops">
+                  <button class="btn" :disabled="agentImport.busy || !agentImport.sourceContent.trim()" @click="previewImport">预览</button>
+                  <button class="btn btn-primary" :disabled="agentImport.busy || !agentImport.name.trim() || !agentImport.sourceContent.trim()" @click="submitImport">{{ agentImport.selected ? '导入此人格' : '导入' }}</button>
+                </div>
+                <p v-if="agentImport.busy" class="empty">处理中…</p>
+                <p v-if="agentImport.error" class="error">{{ agentImport.error }}</p>
+                <template v-if="agentImport.preview">
+                  <div class="sess-meta" style="margin-top:8px"><span>预览</span><span class="mono">{{ agentImport.preview.name }}</span></div>
+                  <div class="preview-valid">
+                    <template v-if="agentImport.preview.validation && agentImport.preview.validation.valid">
+                      <span class="ok">✅ 可导入：provider={{ agentImport.preview.validation.provider || '—' }}，model={{ agentImport.preview.validation.model || '占位（导入后可改）' }}</span>
+                    </template>
+                    <template v-else>
+                      <span class="error">❌ 无法导入：{{ (agentImport.preview.validation && agentImport.preview.validation.message) || '未知错误' }}</span>
+                    </template>
+                  </div>
+                  <div class="info-grid">
+                    <div class="info-row"><span class="k">role</span><span>{{ agentImport.preview.expert.role || '—' }}</span></div>
+                    <div class="info-row"><span class="k">traits</span><span>{{ agentImport.preview.expert.traits || '—' }}</span></div>
+                    <div class="info-row"><span class="k">background</span><span>{{ agentImport.preview.expert.background || '—' }}</span></div>
+                    <div class="info-row"><span class="k">communication</span><span>{{ agentImport.preview.expert.communication || '—' }}</span></div>
+                    <div class="info-row"><span class="k">keyRules</span><span>{{ agentImport.preview.expert.keyRules || '—' }}</span></div>
+                    <div class="info-row"><span class="k">boundaries</span><span>{{ agentImport.preview.expert.boundaries || '—' }}</span></div>
+                    <div class="info-row"><span class="k">sampleStyle</span><span>{{ agentImport.preview.expert.sampleStyle || '—' }}</span></div>
+                  </div>
+                  <label class="empty" style="display:block;margin:6px 0 2px">渲染出的 AGENT.md（落盘前只读预览）</label>
+                  <div class="gen-file"><textarea class="mono filetext" readonly :value="agentImport.preview.agentMarkdown"></textarea></div>
+                </template>
+              </div>
             </div>
 
             <!-- 详情视图：Tab（基本信息 / 文件 / 会话） -->
@@ -1675,18 +3213,135 @@ const outputRows = computed(() =>
                   <div class="info-row"><span class="k">skills</span>
                     <div>
                       <div class="skill-picker">
-                        <label v-for="s in skills.data" :key="s.name" class="skill-opt" :title="s.description">
-                          <input type="checkbox" :value="s.name" v-model="agentBinding.selected" />
-                          <span class="mono">{{ s.name }}</span>
-                        </label>
+                        <span v-if="!skills.data.length" class="empty">（暂无已安装 Skill）</span>
+                        <template v-else>
+                          <input class="gen-input skill-search" v-model="skillFilter.query" placeholder="按名称或描述筛选已安装 Skill" />
+                          <div v-if="editSkillHiddenCount > 0" class="skill-hidden-hint">
+                            <span>当前筛选隐藏了 {{ editSkillHiddenCount }} 项已选</span>
+                            <button type="button" class="btn" @click="skillFilter.showHidden = true" v-if="!skillFilter.showHidden">纳入视野</button>
+                            <button type="button" class="btn" @click="skillFilter.showHidden = false" v-else>恢复筛选</button>
+                          </div>
+                          <div class="skill-batch">
+                            <button type="button" class="btn" @click="agentBinding.selected = selectAllVisible(editSkillVisible, agentBinding.selected); agentBinding.saved = false" :disabled="!editSkillVisible.length">全选当前</button>
+                            <button type="button" class="btn" @click="agentBinding.selected = clearVisible(editSkillVisible, agentBinding.selected); agentBinding.saved = false" :disabled="!editSkillVisible.length">清空当前</button>
+                          </div>
+                          <label v-for="s in editSkillRender" :key="s.name" class="skill-opt" :class="{ 'skill-hidden': s.hidden }" :title="s.description">
+                            <input type="checkbox" :value="s.name" v-model="agentBinding.selected" @change="agentBinding.saved = false" />
+                            <span class="mono">{{ s.name }}</span>
+                          </label>
+                          <span v-if="!editSkillRender.length" class="empty">（无匹配 Skill）</span>
+                        </template>
                       </div>
-                      <div class="ops"><button class="btn" :disabled="agentBinding.saving" @click="saveAgentBindings">{{ agentBinding.saving ? '保存中…' : '保存绑定' }}</button></div>
+                      <div class="ops">
+                        <button class="btn" :disabled="agentBinding.saving" @click="saveAgentBindings">{{ agentBinding.saving ? '保存中…' : '保存绑定' }}</button>
+                        <span v-if="agentBinding.saved" class="ok">已保存，下一轮对话生效</span>
+                      </div>
                       <p v-if="agentBinding.error" class="error">{{ agentBinding.error }}</p>
                       <p v-for="(issue, i) in agentBinding.issues" :key="i" class="error">{{ issue.type }}：{{ issue.message }}</p>
                     </div>
                   </div>
+                  <div class="info-row"><span class="k">knowledge</span>
+                    <div>
+                      <div class="skill-picker">
+                        <span v-if="!kb.data.length" class="empty">（暂无知识库）</span>
+                        <label v-for="b in kb.data" :key="b.name" class="skill-opt" :title="b.description">
+                          <input type="checkbox" :value="b.name" v-model="agentKb.selected" @change="agentKb.saved = false" />
+                          <span class="mono">{{ b.name }}</span>
+                        </label>
+                      </div>
+                      <div class="ops">
+                        <button class="btn" :disabled="agentKb.saving" @click="saveAgentKnowledge">{{ agentKb.saving ? '保存中…' : '保存知识库绑定' }}</button>
+                        <span v-if="agentKb.saved" class="ok">已保存，下一轮对话生效</span>
+                      </div>
+                      <p v-if="agentKb.error" class="error">{{ agentKb.error }}</p>
+                      <p v-for="(issue, i) in agentKb.issues" :key="'kb'+i" class="error">{{ issue.type }}：{{ issue.message }}</p>
+                    </div>
+                  </div>
                   <div class="info-row"><span class="k">定时</span><span class="mono">{{ (agentDetail.agent.schedules || []).map((s) => s.cron + ' (' + s.zone + ')').join('；') || '—' }}</span></div>
                 </template>
+              </div>
+
+              <!-- 025 人格卡：7 字段展示 + 编辑（PUT /agents/{name}/persona 落盘成 AGENT.md persona 段，随每轮注入 system prompt） -->
+              <div v-if="agentDetail.tab === 'info'" style="margin-top:14px">
+                <div class="sess-meta"><span>人格</span>
+                  <button v-if="!personaEdit.open" class="btn" @click="startEditPersona">{{ agentDetail.agent.persona ? '编辑人格' : '设置人格' }}</button>
+                </div>
+                <template v-if="personaEdit.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">name</label><input v-model="personaEdit.name" class="gen-input" placeholder="人格名（必填）" /></div>
+                    <div class="info-row edit"><label class="k">role</label><input v-model="personaEdit.role" class="gen-input" placeholder="角色定位（必填）" /></div>
+                    <div class="info-row edit"><label class="k">traits</label><textarea v-model="personaEdit.traits" class="gen-input" rows="2" placeholder="个性特征"></textarea></div>
+                    <div class="info-row edit"><label class="k">tone</label><textarea v-model="personaEdit.tone" class="gen-input" rows="2" placeholder="说话语气"></textarea></div>
+                    <div class="info-row edit"><label class="k">values</label><textarea v-model="personaEdit.values" class="gen-input" rows="2" placeholder="价值观"></textarea></div>
+                    <div class="info-row edit"><label class="k">boundaries</label><textarea v-model="personaEdit.boundaries" class="gen-input" rows="2" placeholder="边界/原则"></textarea></div>
+                    <div class="info-row edit"><label class="k">sampleStyle</label><textarea v-model="personaEdit.sampleStyle" class="gen-input" rows="3" placeholder="一句话风格示例"></textarea></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="personaEdit.saving || !personaEdit.name.trim() || !personaEdit.role.trim()" @click="savePersona">保存</button>
+                      <button class="btn" :disabled="personaEdit.saving" @click="cancelEditPersona">取消</button>
+                      <span v-if="personaEdit.saving" class="empty">保存中…</span>
+                      <span v-if="personaEdit.error" class="error">{{ personaEdit.error }}</span>
+                    </div>
+                    <p class="empty">name/role 为必填；这 7 个字段会被写进 AGENT.md 的 persona 段，每轮对话固定注入 system prompt。</p>
+                  </div>
+                </template>
+                <div v-else class="info-grid">
+                  <template v-if="agentDetail.agent.persona">
+                    <div class="info-row"><span class="k">name</span><span>{{ agentDetail.agent.persona.name }}</span></div>
+                    <div class="info-row"><span class="k">role</span><span>{{ agentDetail.agent.persona.role }}</span></div>
+                    <div class="info-row"><span class="k">traits</span><span>{{ agentDetail.agent.persona.traits || '—' }}</span></div>
+                    <div class="info-row"><span class="k">tone</span><span>{{ agentDetail.agent.persona.tone || '—' }}</span></div>
+                    <div class="info-row"><span class="k">values</span><span>{{ agentDetail.agent.persona.values || '—' }}</span></div>
+                    <div class="info-row"><span class="k">boundaries</span><span>{{ agentDetail.agent.persona.boundaries || '—' }}</span></div>
+                    <div class="info-row"><span class="k">sampleStyle</span><span>{{ agentDetail.agent.persona.sampleStyle || '—' }}</span></div>
+                  </template>
+                  <p v-else class="empty" style="padding:12px">未设置人格。点右上「设置人格」按 7 字段定义；或到「新建 Agent → 从人格库导入」从 12 个默认人格预设导入。</p>
+                </div>
+              </div>
+
+              <!-- 041 / #504：GOVERNANCE.yml — health/owner/visibility（GET/PUT /agents/{name}/governance） -->
+              <div v-if="agentDetail.tab === 'info'" style="margin-top:14px">
+                <div class="sess-meta"><span>治理</span>
+                  <button v-if="!governanceEdit.open && governanceEdit.loaded" class="btn" @click="startEditGovernance">编辑治理</button>
+                </div>
+                <p v-if="governanceEdit.loading" class="empty">加载治理…</p>
+                <p v-else-if="governanceEdit.error && !governanceEdit.open" class="error">{{ governanceEdit.error }}</p>
+                <template v-else-if="governanceEdit.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">health</label>
+                      <select v-model="governanceEdit.health" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="DEPRECATED">DEPRECATED</option>
+                        <option value="OFFLINE">OFFLINE</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">owner</label><input v-model="governanceEdit.owner" class="gen-input" placeholder="属主用户名（可选）" /></div>
+                    <div class="info-row edit"><label class="k">visibility</label>
+                      <select v-model="governanceEdit.visibility" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="PRIVATE">PRIVATE</option>
+                        <option value="WORKSPACE">WORKSPACE</option>
+                        <option value="PUBLIC">PUBLIC</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">version</label><input v-model="governanceEdit.version" class="gen-input" placeholder="版本（展示/审计）" /></div>
+                    <div class="info-row edit"><label class="k">riskLevel</label><input v-model="governanceEdit.riskLevel" class="gen-input" placeholder="风险等级（展示）" /></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="governanceEdit.saving" @click="saveGovernance">保存</button>
+                      <button class="btn" :disabled="governanceEdit.saving" @click="cancelEditGovernance">取消</button>
+                      <span v-if="governanceEdit.saving" class="empty">保存中…</span>
+                      <span v-if="governanceEdit.error" class="error">{{ governanceEdit.error }}</span>
+                    </div>
+                    <p class="empty">写入 Agent 目录 GOVERNANCE.yml。OFFLINE 时（需开启 rbac + asset-governance）不可调用；PRIVATE 仅属主/ADMIN 可管。空值表示未设治理。</p>
+                  </div>
+                </template>
+                <div v-else-if="governanceEdit.loaded" class="info-grid">
+                  <div class="info-row"><span class="k">health</span><span class="mono">{{ blankGov(governanceEdit.health) }}</span></div>
+                  <div class="info-row"><span class="k">owner</span><span>{{ blankGov(governanceEdit.owner) }}</span></div>
+                  <div class="info-row"><span class="k">visibility</span><span class="mono">{{ blankGov(governanceEdit.visibility) }}</span></div>
+                  <div class="info-row"><span class="k">version</span><span>{{ blankGov(governanceEdit.version) }}</span></div>
+                  <div class="info-row"><span class="k">riskLevel</span><span>{{ blankGov(governanceEdit.riskLevel) }}</span></div>
+                </div>
               </div>
 
               <!-- Tab 3：文件浏览器（可编辑） -->
@@ -1773,10 +3428,14 @@ const outputRows = computed(() =>
               <!-- Tab 4：会话 —— 每个 Agent 一个固定 session，直接作为对话展示 -->
               <div v-else-if="agentDetail.tab === 'chat'">
                 <div class="sess-meta"><span class="mono">{{ chat.sessionId || '（会话尚未创建）' }}</span></div>
-                <p v-if="chat.loading" class="empty">加载中…</p>
+                <div class="chat-run-hint">
+                  <p>会话发送会等整轮结束才返回。要看实时进度，请用「立即触发」或到「流式管理」。</p>
+                  <button class="btn" type="button" @click="select('runs')">打开流式管理</button>
+                </div>
+                <p v-if="chat.loading && !chat.messages.length" class="empty">加载中…</p>
                 <p v-else-if="chat.error" class="error">出错：{{ chat.error }}</p>
                 <template v-else>
-                  <p v-if="!chat.messages.length" class="empty">（还没有对话，在下面发一条消息开始）</p>
+                  <p v-if="!chat.messages.length && !chat.sending" class="empty">（还没有对话，在下面发一条消息开始）</p>
                   <div v-else class="chat" ref="chatScrollEl">
                     <div v-for="(t, i) in chatTurns" :key="i" class="turn">
                       <!-- 用户提问 -->
@@ -1800,6 +3459,17 @@ const outputRows = computed(() =>
                       <div v-if="t.answer" class="msg assistant answer">
                         <div class="msg-role">{{ roleLabel('assistant') }}</div>
                         <pre class="msg-body">{{ t.answer.content || '（空）' }}</pre>
+                      </div>
+                    </div>
+                    <!-- 019：流式进行中的打字机气泡与工具状态（done 后由 loadChat 的正式历史替换） -->
+                    <div v-if="chat.sending && (chat.stream || chat.toolHint)" class="turn">
+                      <div v-if="chat.toolHint" class="msg tool">
+                        <div class="msg-role">{{ roleLabel('tool') }}<span class="mono tool-name"> · {{ chat.toolHint }}</span></div>
+                        <pre class="msg-body">调用中…</pre>
+                      </div>
+                      <div v-if="chat.stream" class="msg assistant answer">
+                        <div class="msg-role">{{ roleLabel('assistant') }}</div>
+                        <pre class="msg-body">{{ chat.stream }}</pre>
                       </div>
                     </div>
                   </div>
@@ -1846,15 +3516,16 @@ const outputRows = computed(() =>
                 <p v-if="execHistory.loading" class="empty">加载中…</p>
                 <p v-else-if="execHistory.error" class="error">出错：{{ execHistory.error }}</p>
                 <table v-else>
-                  <thead><tr><th>状态</th><th>来源</th><th>开始时间</th><th>结束时间</th><th>时长</th><th>错误</th></tr></thead>
+                  <thead><tr><th>状态</th><th>来源</th><th>开始时间</th><th>结束时间</th><th>时长</th><th>Trace</th><th>错误</th></tr></thead>
                   <tbody>
-                    <tr v-if="!execHistory.data.length"><td colspan="6" class="empty">（还没有执行记录 · 点「立即触发」跑一次）</td></tr>
-                    <tr v-for="e in execHistory.data" :key="e.id">
+                    <tr v-if="!execHistory.data.length"><td colspan="7" class="empty">（还没有执行记录 · 点「立即触发」跑一次）</td></tr>
+                    <tr v-for="e in execHistory.data" :key="e.id" class="clickable" @click="openRunWorkbench(e.id)">
                       <td><span :class="['exec-badge', e.status.toLowerCase()]">{{ execStatusLabel(e.status) }}</span></td>
                       <td>{{ e.source === 'schedule' ? '定时' : '手动' }}</td>
                       <td class="mono">{{ fmtTime(e.startedAt) }}</td>
                       <td class="mono">{{ fmtTime(e.endedAt) }}</td>
                       <td class="mono">{{ fmtDuration(e.durationMs) }}</td>
+                      <td class="mono trace-cell">{{ e.traceId || '—' }}</td>
                       <td class="error">{{ e.errorMessage || '' }}</td>
                     </tr>
                   </tbody>
@@ -1920,6 +3591,81 @@ const outputRows = computed(() =>
             </template>
           </div>
 
+          <!-- 人格库（025）：copy-in 模板库独立成页。内置 12 只读 + 自定义 CRUD；Agent 新建「从人格库导入」只从这里选 -->
+          <div v-else-if="active === 'personas'">
+            <div class="toolbar">
+              <button class="btn btn-primary" @click="openPersonaEditor()">+ 新建人格</button>
+            </div>
+            <p class="empty" style="margin:4px 0 14px">
+              人格库 = copy-in 模板库：Agent 新建页「从人格库导入」选中某人时，源文件原文会被复制进 Agent 定义——之后改了库里的人格，
+              不影响已导入的 Agent。内置 12 个随 jar 升级自动更新、永远只读；自定义人格保存在
+              <span class="mono">.oryxos/personas/</span>，可改可删、跨重启持久。
+            </p>
+            <p v-if="personaPageError" class="error">{{ personaPageError }}</p>
+
+            <!-- 新建 / 编辑 / 查看 弹框：源文件原文即库内容（frontmatter name/description/emoji 投影卡片 meta） -->
+            <div v-if="personaForm.open" class="modal-overlay" @click.self="cancelPersonaForm()">
+              <div class="modal-card">
+                <div class="modal-head">
+                  <h3>{{ personaForm.viewOnly ? '查看人格' : personaForm.editing ? '编辑人格' : '新建人格' }}</h3>
+                  <button class="modal-x" @click="cancelPersonaForm()">✕</button>
+                </div>
+                <div class="modal-body">
+                  <template v-if="!personaForm.viewOnly">
+                    <label class="empty" style="display:block;margin:0 0 2px">从本地 .md 文件导入（读入下方文本框；新建时 key 从文件名派生，可改）</label>
+                    <input type="file" accept=".md,text/markdown" class="gen-input" @change="onPersonaFile" />
+                  </template>
+                  <input v-model="personaForm.key" class="gen-input" :disabled="personaForm.editing || personaForm.viewOnly"
+                         placeholder="key（字母/数字/下划线/连字符；也是导入时的建议 Agent 名）" />
+                  <p v-if="personaForm.busy" class="empty">加载中…</p>
+                  <textarea v-else v-model="personaForm.sourceContent" class="gen-draft mono" rows="14" :readonly="personaForm.viewOnly"
+                            placeholder="---&#10;name: 你的专家名&#10;description: 一句话描述&#10;emoji: 🎯&#10;---&#10;# 你的专家&#10;你是**专家**…&#10;&#10;## 🧠 身份与记忆&#10;- **角色**：…&#10;- **性格**：…&#10;（agency-agents-zh 人格文件格式；身份段按 角色/性格 等行级关键字解析成 persona 7 字段）"></textarea>
+                  <p v-if="personaForm.viewOnly" class="empty">内置人格只读，随 jar 升级自动更新；不能编辑或删除。</p>
+                  <p v-else class="empty">导入该人格时，源文件原文会被复制进 Agent 定义（copy-in），改这里不影响已导入的 Agent。</p>
+                  <p v-if="personaForm.error" class="error">{{ personaForm.error }}</p>
+                </div>
+                <div class="modal-foot">
+                  <button class="btn" @click="cancelPersonaForm">关闭</button>
+                  <button v-if="!personaForm.viewOnly" class="btn btn-primary"
+                          :disabled="personaForm.busy || !personaForm.sourceContent.trim() || (!personaForm.editing && !personaForm.key.trim())"
+                          @click="savePersonaForm">{{ personaForm.editing ? '保存修改' : '创建' }}</button>
+                </div>
+              </div>
+            </div>
+
+            <p v-if="personaPresets.loading" class="empty">加载中…</p>
+            <p v-else-if="personaPresets.error" class="error">出错：{{ personaPresets.error }}</p>
+            <table v-else>
+              <thead><tr><th>人格</th><th>类型</th><th>key</th><th>描述</th><th>来源</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-if="!personaPresets.data.length"><td colspan="6" class="empty">（暂无自定义人格 · 点「+ 新建人格」开始）</td></tr>
+                <tr v-for="p in personaPresets.data" :key="p.key">
+                  <td>
+                    <span class="persona-cell-name"><span class="preset-emoji">{{ p.emoji }}</span>{{ p.label }}</span>
+                  </td>
+                  <td class="persona-type">
+                    <span class="preset-badge" :class="p.builtin ? 'b-in' : 'b-cu'">{{ p.builtin ? '内置' : '自定义' }}</span>
+                  </td>
+                  <td class="mono">{{ p.key }}</td>
+                  <td>{{ p.description || '—' }}</td>
+                  <td class="mono">{{ p.builtin ? (p.sourceFile || 'classpath personas/' + p.key + '.md') : '.oryxos/personas/' + p.key + '.md' }}</td>
+                  <td class="ops">
+                    <button class="btn" @click="viewPersona(p)">查看</button>
+                    <button v-if="!p.builtin" class="btn" @click="editPersona(p)">编辑</button>
+                    <button v-if="!p.builtin" class="btn" @click="deletePersona(p)">删除</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <!-- 来源注记：放在列表下方作页面底部脚注——新建人格往列表里加的行永远在它上边，提示恒在页底 -->
+            <p class="persona-src-foot">
+              内置 12 个人格预设的提示词源自 MIT 许可的 agency-agents 中文社区版
+              <a href="https://github.com/jnMetaCode/agency-agents-zh" target="_blank" rel="noopener">jnMetaCode/agency-agents-zh</a>
+              （上游 <a href="https://github.com/msitarzewski/agency-agents" target="_blank" rel="noopener">msitarzewski/agency-agents</a>，MIT）。
+            </p>
+          </div>
+
           <!-- Notify 渠道：命名通知出口的 CRUD（新建/编辑/删除） -->
           <div v-else-if="active === 'notify-channels'">
             <div class="toolbar">
@@ -1936,15 +3682,63 @@ const outputRows = computed(() =>
                     <option value="wecom">wecom</option>
                     <option value="dingtalk">dingtalk</option>
                     <option value="webhook">webhook</option>
+                    <option value="email">email</option>
+                    <option value="slack">slack</option>
+                    <option value="discord">discord</option>
+                    <option value="telegram">telegram</option>
+                    <option value="whatsapp">whatsapp</option>
+                    <option value="teams">teams</option>
+                    <option value="gchat">gchat</option>
+                    <option value="mattermost">mattermost</option>
+                    <option value="matrix">matrix</option>
+                    <option value="qq">qq</option>
                   </select>
-                  <input v-model="nc.url" class="gen-input" placeholder="Webhook URL" />
+                  <input v-if="nc.type !== 'email'" v-model="nc.url" class="gen-input" :placeholder="notifyNeedsUrl(nc.type) ? 'Webhook URL' : 'Webhook URL（可选；也可用下方 token 字段）'" />
+                  <template v-if="nc.type === 'telegram'">
+                    <input v-model="nc.token" class="gen-input" placeholder="Bot Token（建议 ${TELEGRAM_BOT_TOKEN}）" />
+                    <input v-model="nc.chatId" class="gen-input" placeholder="chat_id（私聊数字 ID，群为负数）" />
+                  </template>
+                  <template v-if="nc.type === 'slack' || nc.type === 'discord'">
+                    <input v-model="nc.token" class="gen-input" placeholder="Bot Token（建议环境变量占位）" />
+                    <input v-model="nc.channelId" class="gen-input" placeholder="channel_id" />
+                  </template>
+                  <template v-if="nc.type === 'whatsapp'">
+                    <input v-model="nc.token" class="gen-input" placeholder="Graph access token" />
+                    <input v-model="nc.phoneNumberId" class="gen-input" placeholder="phone_number_id" />
+                    <input v-model="nc.to" class="gen-input" placeholder="to（E.164）" />
+                  </template>
+                  <template v-if="nc.type === 'matrix'">
+                    <input v-model="nc.homeserver" class="gen-input" placeholder="homeserver（https://matrix.example）" />
+                    <input v-model="nc.token" class="gen-input" placeholder="access token" />
+                    <input v-model="nc.roomId" class="gen-input" placeholder="room_id" />
+                  </template>
+                  <template v-if="nc.type === 'qq'">
+                    <input v-model="nc.token" class="gen-input" placeholder="access_token（建议环境变量占位）" />
+                    <input v-model="nc.groupOpenid" class="gen-input" placeholder="group_openid（群；与 user_openid 二选一）" />
+                    <input v-model="nc.userOpenid" class="gen-input" placeholder="user_openid（单聊；与 group_openid 二选一）" />
+                  </template>
+                  <template v-if="nc.type === 'email'">
+                    <input v-model="nc.host" class="gen-input" placeholder="SMTP host（如 smtp.example.com）" />
+                    <input v-model="nc.port" class="gen-input" placeholder="端口（465/587/25）" />
+                    <input v-model="nc.from" class="gen-input" placeholder="发件人（from）" />
+                    <input v-model="nc.to" class="gen-input" placeholder="收件人（to，逗号分隔）" />
+                    <input v-model="nc.username" class="gen-input" placeholder="用户名（可选）" />
+                    <input v-model="nc.password" class="gen-input" type="password" placeholder="密码（建议填 ${SMTP_PASSWORD}，无认证留空）" />
+                    <input v-model="nc.subject" class="gen-input" placeholder="主题（可选）" />
+                    <select v-model="nc.encryption" class="gen-input">
+                      <option value="">加密方式（自动按端口推断）</option>
+                      <option value="ssl">ssl</option>
+                      <option value="starttls">starttls</option>
+                      <option value="none">none</option>
+                    </select>
+                  </template>
                   <input v-model="nc.description" class="gen-input" placeholder="描述（可选）" />
-                  <p class="empty">{{ nc.editing ? '编辑现有渠道，渠道名不可改。' : 'type 支持 feishu / wecom / dingtalk / webhook；URL 为对应的 Webhook 地址。' }}</p>
+                  <p class="empty">{{ nc.editing ? '编辑现有渠道，渠道名不可改。' : 'webhook 类填 URL；telegram / slack / discord 可改填 token + chat_id 或 channel_id；email 填 SMTP。凭证建议 ${ENV} 占位。' }}</p>
                   <p v-if="nc.error" class="error">{{ nc.error }}</p>
                 </div>
                 <div class="modal-foot">
                   <button class="btn" @click="cancelNc">取消</button>
-                  <button class="btn btn-primary" :disabled="nc.busy || !nc.name || !nc.url" @click="saveNotifyChannel">{{ nc.editing ? '保存修改' : '创建' }}</button>
+                  <button class="btn btn-primary" :disabled="nc.busy || !notifyFormReady()" @click="saveNotifyChannel">{{ nc.editing ? '保存修改' : '创建' }}</button>
                 </div>
               </div>
             </div>
@@ -1957,7 +3751,7 @@ const outputRows = computed(() =>
                 <tr v-for="c in notifyChannels.data" :key="c.name">
                   <td class="mono">{{ c.name }}</td>
                   <td>{{ c.type }}</td>
-                  <td class="mono">{{ c.url }}</td>
+                  <td class="mono">{{ c.type === 'email' ? (c.config ? c.config.host + ':' + c.config.port : '—') : c.url }}</td>
                   <td>{{ c.description || '—' }}</td>
                   <td class="ops">
                     <button class="btn" @click="editNotifyChannel(c)">编辑</button>
@@ -1966,6 +3760,81 @@ const outputRows = computed(() =>
                 </tr>
               </tbody>
             </table>
+          </div>
+
+          <!-- 入站渠道（017/041）：列表 + 治理块（channels.yaml governance:）；CRUD 仍走 API/配置文件 -->
+          <div v-else-if="active === 'inbound-channels'">
+            <template v-if="!inboundChannelDetail">
+              <p class="empty">入站 IM 渠道来自 .oryxos/channels.yaml。本页只读列表并编辑治理块（OFFLINE/PRIVATE 等）；增删改渠道定义仍用 API 或改配置。</p>
+              <p v-if="inboundChannels.loading" class="empty">加载中…</p>
+              <p v-else-if="inboundChannels.error" class="error">出错：{{ inboundChannels.error }}</p>
+              <table v-else>
+                <thead><tr><th>name</th><th>type</th><th>agent</th><th>enabled</th><th style="width:90px">操作</th></tr></thead>
+                <tbody>
+                  <tr v-if="!inboundChannels.data.length"><td colspan="5" class="empty">（暂无入站渠道）</td></tr>
+                  <tr v-for="c in inboundChannels.data" :key="c.name">
+                    <td class="mono">{{ c.name }}</td>
+                    <td class="mono">{{ c.type }}</td>
+                    <td class="mono">{{ c.agent }}</td>
+                    <td>{{ c.enabled === false ? '否' : '是' }}</td>
+                    <td class="ops"><button class="btn" @click="openInboundChannelDetail(c)">治理</button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+            <div v-else>
+              <button class="btn back" @click="closeInboundChannelDetail">← 返回入站渠道列表</button>
+              <div class="sess-meta"><span>入站渠道</span><span class="mono">{{ inboundChannelDetail.name }}</span></div>
+              <div class="info-grid" style="margin:8px 0">
+                <div class="info-row"><span class="k">type</span><span class="mono">{{ inboundChannelDetail.type }}</span></div>
+                <div class="info-row"><span class="k">agent</span><span class="mono">{{ inboundChannelDetail.agent }}</span></div>
+                <div class="info-row"><span class="k">enabled</span><span>{{ inboundChannelDetail.enabled ? '是' : '否' }}</span></div>
+              </div>
+              <div style="margin-top:14px">
+                <div class="sess-meta"><span>治理</span>
+                  <button v-if="!channelGovernance.open && channelGovernance.loaded" class="btn" @click="startEditChannelGovernance">编辑治理</button>
+                </div>
+                <p v-if="channelGovernance.loading" class="empty">加载治理…</p>
+                <p v-else-if="channelGovernance.error && !channelGovernance.open" class="error">{{ channelGovernance.error }}</p>
+                <template v-else-if="channelGovernance.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">health</label>
+                      <select v-model="channelGovernance.health" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="DEPRECATED">DEPRECATED</option>
+                        <option value="OFFLINE">OFFLINE</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">owner</label><input v-model="channelGovernance.owner" class="gen-input" placeholder="属主用户名（可选）" /></div>
+                    <div class="info-row edit"><label class="k">visibility</label>
+                      <select v-model="channelGovernance.visibility" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="PRIVATE">PRIVATE</option>
+                        <option value="WORKSPACE">WORKSPACE</option>
+                        <option value="PUBLIC">PUBLIC</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">version</label><input v-model="channelGovernance.version" class="gen-input" placeholder="版本（展示/审计）" /></div>
+                    <div class="info-row edit"><label class="k">riskLevel</label><input v-model="channelGovernance.riskLevel" class="gen-input" placeholder="风险等级（展示）" /></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="channelGovernance.saving" @click="saveChannelGovernance">保存</button>
+                      <button class="btn" :disabled="channelGovernance.saving" @click="cancelEditChannelGovernance">取消</button>
+                      <span v-if="channelGovernance.saving" class="empty">保存中…</span>
+                      <span v-if="channelGovernance.error" class="error">{{ channelGovernance.error }}</span>
+                    </div>
+                    <p class="empty">写入 channels.yaml 的 governance 块（非 GOVERNANCE.yml）。OFFLINE 时（需开启 rbac + asset-governance）入站消息被拒；PRIVATE 仅属主/ADMIN 可管。空值表示未设治理。</p>
+                  </div>
+                </template>
+                <div v-else-if="channelGovernance.loaded" class="info-grid">
+                  <div class="info-row"><span class="k">health</span><span class="mono">{{ blankGov(channelGovernance.health) }}</span></div>
+                  <div class="info-row"><span class="k">owner</span><span>{{ blankGov(channelGovernance.owner) }}</span></div>
+                  <div class="info-row"><span class="k">visibility</span><span class="mono">{{ blankGov(channelGovernance.visibility) }}</span></div>
+                  <div class="info-row"><span class="k">version</span><span>{{ blankGov(channelGovernance.version) }}</span></div>
+                  <div class="info-row"><span class="k">riskLevel</span><span>{{ blankGov(channelGovernance.riskLevel) }}</span></div>
+                </div>
+              </div>
+            </div>
           </div>
 
           <!-- Provider：命名模型 Provider 的 CRUD（新建/编辑/删除），apiKey 明文展示 -->
@@ -2014,6 +3883,46 @@ const outputRows = computed(() =>
                     </button>
                     <button class="btn" @click="editProvider(p)">编辑</button>
                     <button class="btn" @click="deleteProvider(p.name)">删除</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h3 class="sec">模型定价</h3>
+            <div class="toolbar">
+              <button class="btn btn-primary" @click="openPricingForm()">+ 新增定价</button>
+            </div>
+            <div v-if="pricingForm.open" class="modal-overlay" @click.self="cancelPricing()">
+              <div class="modal-card">
+                <div class="modal-head"><h3>{{ pricingForm.editing ? '编辑模型定价' : '新增模型定价' }}</h3><button class="modal-x" @click="cancelPricing()">✕</button></div>
+                <div class="modal-body">
+                  <input v-model="pricingForm.provider" class="gen-input" :disabled="!!pricingForm.editing" placeholder="provider 名，如 deepseek" />
+                  <input v-model="pricingForm.model" class="gen-input" :disabled="!!pricingForm.editing" placeholder="模型名，如 deepseek-chat" />
+                  <input v-model="pricingForm.promptPrice" class="gen-input" placeholder="输入单价（元/百万 token），如 1.0" />
+                  <input v-model="pricingForm.completionPrice" class="gen-input" placeholder="输出单价（元/百万 token），如 2.0" />
+                  <p class="empty">单价单位「元/百万 token」，留空=未定价（成本记「未计量」）。</p>
+                  <p v-if="pricingForm.error" class="error">{{ pricingForm.error }}</p>
+                </div>
+                <div class="modal-foot">
+                  <button class="btn" @click="cancelPricing">取消</button>
+                  <button class="btn btn-primary" :disabled="pricingForm.busy || !pricingForm.provider || !pricingForm.model" @click="savePricing">保存</button>
+                </div>
+              </div>
+            </div>
+            <p v-if="pricing.loading" class="empty">加载中…</p>
+            <p v-else-if="pricing.error" class="error">出错：{{ pricing.error }}</p>
+            <table v-else>
+              <thead><tr><th>provider</th><th>model</th><th>输入单价</th><th>输出单价</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-if="!pricing.data.length"><td colspan="5" class="empty">（暂无定价 · 点上面「新增定价」）</td></tr>
+                <tr v-for="row in pricing.data" :key="row.id">
+                  <td class="mono">{{ row.provider }}</td>
+                  <td class="mono">{{ row.model }}</td>
+                  <td class="mono">{{ row.promptPrice ?? '—' }}</td>
+                  <td class="mono">{{ row.completionPrice ?? '—' }}</td>
+                  <td class="ops">
+                    <button class="btn" @click="openPricingForm(row)">编辑</button>
+                    <button class="btn" @click="deletePricing(row.id)">删除</button>
                   </td>
                 </tr>
               </tbody>
@@ -2120,7 +4029,7 @@ const outputRows = computed(() =>
               <!-- 执行记录详情视图 -->
               <div v-if="execDetail">
                 <button class="btn back" @click="closeExecutions">← 返回定时任务</button>
-                <div class="sess-meta"><span class="mono">{{ execDetail.taskId }}</span><span class="empty">执行记录（最近 100 条）</span></div>
+                <div class="sess-meta"><span class="mono">{{ execDetail.scheduleId }}</span><span class="empty">执行记录（最近 100 条）</span></div>
                 <p v-if="execDetail.loading" class="empty">加载中…</p>
                 <p v-else-if="execDetail.error" class="error">出错：{{ execDetail.error }}</p>
                 <template v-else-if="execDetail.data">
@@ -2129,7 +4038,7 @@ const outputRows = computed(() =>
                     <thead><tr><th>开始时间</th><th>结果</th><th>耗时(ms)</th><th>会话</th><th>错误</th></tr></thead>
                     <tbody>
                       <tr v-for="(e, i) in execDetail.data" :key="i">
-                        <td class="mono">{{ e.startedAt }}</td>
+                        <td class="mono">{{ e.startedAt }}<span v-if="e.legacyMigrated" class="tag">迁移前历史{{ e.legacyTaskKey ? `: ${e.legacyTaskKey}` : '' }}</span></td>
                         <td><span :class="e.success ? 'ok' : 'off'">{{ e.success ? '成功' : '失败' }}</span></td>
                         <td>{{ e.durationMs }}</td>
                         <td class="mono">{{ e.sessionId ?? '—' }}</td>
@@ -2146,15 +4055,15 @@ const outputRows = computed(() =>
                 </thead>
                 <tbody>
                   <tr v-if="!state.schedules.data.length"><td :colspan="cols('schedules').length + 1" class="empty">（暂无定时任务 · 在 Profile 的 schedules 里定义）</td></tr>
-                  <tr v-for="row in state.schedules.data" :key="row.taskId">
-                    <td v-for="c in cols('schedules')" :key="c" :class="{ mono: c === 'taskId' || c === 'cron' }">
+                  <tr v-for="row in state.schedules.data" :key="row.scheduleId">
+                    <td v-for="c in cols('schedules')" :key="c" :class="{ mono: c === 'key' || c === 'cron' }">
                       <span v-if="c === 'enabled'" :class="row.enabled ? 'ok' : 'off'">{{ row.enabled ? '启用' : '停用' }}</span>
                       <template v-else>{{ row[c] ?? '—' }}</template>
                     </td>
                     <td class="ops">
-                      <button class="btn" :disabled="busy === row.taskId" @click="runTask(row.taskId)">立即执行</button>
-                      <button class="btn" :disabled="busy === row.taskId" @click="toggleTask(row)">{{ row.enabled ? '停用' : '启用' }}</button>
-                      <button class="btn" @click="openExecutions(row.taskId)">执行记录</button>
+                      <button class="btn" :disabled="busy === row.scheduleId" @click="runTask(row.scheduleId)">立即执行</button>
+                      <button class="btn" :disabled="busy === row.scheduleId" @click="toggleTask(row)">{{ row.enabled ? '停用' : '启用' }}</button>
+                      <button class="btn" @click="openExecutions(row.scheduleId)">执行记录</button>
                     </td>
                   </tr>
                 </tbody>
@@ -2174,7 +4083,7 @@ const outputRows = computed(() =>
                     <span class="empty">{{ sessionDetail.data.messages.length }} 条消息</span>
                   </div>
                   <p v-if="!sessionDetail.data.messages.length" class="empty">（该会话暂无对话内容）</p>
-                  <div v-else class="chat">
+                  <div v-else class="chat" ref="sessionDetailScrollEl">
                     <div v-for="(m, i) in sessionDetail.data.messages" :key="i" :class="['msg', m.role]">
                       <div class="msg-role">
                         {{ roleLabel(m.role) }}<span v-if="m.toolName" class="mono tool-name"> · {{ m.toolName }}</span>
@@ -2221,6 +4130,9 @@ const outputRows = computed(() =>
 </template>
 
 <style scoped>
+/* trace ID 完整展示（021/023）：小号等宽不换行——截断会让复制变成折磨 */
+.trace-cell { font-size: 11px; white-space: nowrap; }
+
 .layout { display: flex; min-height: 100vh; }
 .nav {
   width: 200px; background: var(--bg-soft); border-right: 1px solid var(--border);
@@ -2246,13 +4158,25 @@ table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
 th { color: var(--text-2); font-weight: 500; }
 .empty { color: var(--text-3); }
+.persona-src-foot {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-3);
+  border-top: 1px dashed var(--border);
+  margin: 16px 0 0;
+  padding-top: 10px;
+}
+.persona-src-foot a { color: var(--brand); text-decoration: none; }
+.persona-src-foot a:hover { text-decoration: underline; }
 .error { color: var(--err); }
 .tag { display: inline-block; background: var(--bg-mute); color: var(--brand); border-radius: var(--radius); padding: 2px 8px; margin-right: 6px; }
 .memtext { background: var(--bg-soft); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; white-space: pre-wrap; }
 .exec-badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--border); }
-.exec-badge.running { color: var(--brand); border-color: var(--brand); }
-.exec-badge.success { color: #16a34a; border-color: #16a34a; }
+.exec-badge.running, .exec-badge.queued { color: var(--brand); border-color: var(--brand); }
+.exec-badge.success { color: var(--ok); border-color: var(--ok); }
 .exec-badge.failed { color: var(--err); border-color: var(--err); }
+.exec-badge.cancelling, .exec-badge.cancelled { color: var(--brand); border-color: var(--brand); }
+.clickable { cursor: pointer; }
 
 /* 定时任务：状态标记 + 操作按钮 */
 .ok { color: var(--ok); }
@@ -2295,6 +4219,19 @@ th { color: var(--text-2); font-weight: 500; }
 .hero-sub { color: var(--text-2); margin: 12px 0 0; max-width: 640px; line-height: 1.6; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 28px; }
 .card { background: var(--bg-soft); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+.bars { margin-bottom: 24px; }
+.bar-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.bar-label { width: 160px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+.bar-track { flex: 1; height: 14px; background: var(--bg-mute); border-radius: 7px; overflow: hidden; }
+.bar-fill { height: 100%; background: var(--brand); border-radius: 7px; }
+.bar-val { width: 140px; flex-shrink: 0; font-size: 12px; color: var(--text-2); }
+.bar-row.clickable { cursor: pointer; }
+.bar-row.clickable:hover { opacity: 0.85; }
+.bar-row.on .bar-label { color: var(--brand); font-weight: 600; }
+.filter-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 16px; padding: 8px 12px; background: var(--brand-soft); border-radius: 6px; }
+.pager { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.pager select { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 6px; color: var(--text-1); padding: 4px 8px; }
+.pager .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .card-val { font-size: 30px; font-weight: 700; color: var(--brand); font-family: var(--font-mono); line-height: 1; }
 .card-label { margin-top: 8px; font-weight: 500; }
 .card-hint { margin-top: 4px; font-size: 12px; color: var(--text-3); }
@@ -2328,6 +4265,13 @@ th { color: var(--text-2); font-weight: 500; }
 .skill-picker { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
 .skill-opt { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; cursor: pointer; }
 .skill-opt:hover { border-color: var(--brand); }
+/* 028-agent-skill-filter：搜索框横铺、批量与隐藏提示整行 */
+.skill-search { flex: 1 1 100%; margin-bottom: 2px; }
+.skill-batch { flex: 1 1 100%; display: flex; gap: 8px; }
+.skill-batch .btn { padding: 2px 8px; font-size: 12px; }
+.skill-hidden-hint { flex: 1 1 100%; display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim, #888); }
+.skill-hidden-hint .btn { padding: 1px 8px; font-size: 12px; }
+.skill-opt.skill-hidden { opacity: 0.65; border-style: dashed; } /* 被筛选隐藏、临时纳入视野的已选项 */
 /* 新增/创建/启用类主操作：橙色高亮，跟其余次要操作（编辑/删除/取消）区分开 */
 .btn-primary { background: var(--brand); border-color: var(--brand); color: #fff; font-weight: 500; }
 .btn-primary:hover:not(:disabled) { background: var(--brand-2); border-color: var(--brand-2); color: #fff; }
@@ -2391,6 +4335,24 @@ th { color: var(--text-2); font-weight: 500; }
 .chat-send-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-top: 8px; }
 .send-mode-toggle { margin-bottom: 0; }
 .chat-send-hint { font-size: 12px; }
+.chat-run-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.chat-run-hint p {
+  margin: 0;
+  flex: 1 1 260px;
+  color: var(--text-2);
+  line-height: 1.6;
+  font-size: 13px;
+}
 
 @media (max-width: 640px) { .layout { flex-direction: column; } .nav { width: auto; flex-direction: row; flex-wrap: wrap; } .readonly { display: none; } .ws { flex-direction: column; } .ws-tree { width: auto; } }
 
@@ -2412,4 +4374,19 @@ th { color: var(--text-2); font-weight: 500; }
 }
 @keyframes boot-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .boot-spinner { animation: none; } }
+/* 人格库（025）：预设卡片（emoji + label + 描述），Agent 导入页选中高亮；人格库页表格复用 emoji/badge */
+.preset-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 176px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-soft); color: var(--text-1); text-align: left; cursor: pointer; }
+.preset-opt:hover { border-color: var(--brand); }
+.preset-opt.on { border-color: var(--brand); background: color-mix(in srgb, var(--brand) 12%, var(--bg-soft)); color: var(--text-1); }
+.preset-opt:disabled { opacity: .55; cursor: default; }
+.preset-emoji { font-size: 18px; line-height: 1; }
+.preset-label { font-size: 13px; font-weight: 600; }
+.preset-desc { font-size: 11px; line-height: 1.4; color: var(--text-2); }
+.preset-badge { margin-left: 4px; font-size: 10px; font-weight: 400; padding: 1px 6px; border-radius: 999px; vertical-align: 1px; white-space: nowrap; }
+.preset-badge.b-in { color: var(--muted, #888); background: rgba(128, 128, 128, 0.15); }
+.preset-badge.b-cu { color: var(--ok); background: rgba(34, 197, 94, 0.12); }
+/* 人格库页「人格」列表格：人格列 = emoji+label 单行不拆词；类型列单独放「内置/自定义」徽标 */
+.persona-cell-name { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+td.persona-type .preset-badge, .persona-cell-name .preset-badge { margin-left: 0; }
+.preview-valid { margin-top: 6px; font-size: 12px; }
 </style>

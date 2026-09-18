@@ -3,7 +3,6 @@ package io.oryxos.core.agent;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -20,6 +19,12 @@ import static org.mockito.Mockito.when;
 import io.oryxos.core.OryxTool;
 import io.oryxos.core.ToolResult;
 import io.oryxos.core.provider.ToolCallRequest;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -54,6 +59,7 @@ class ToolExecutorTest {
     verify(auditor)
         .record(
             eq("s-1"),
+            eq("agent-x"),
             eq("http_get"),
             contains("wttr.in"),
             contains("晴"),
@@ -63,22 +69,55 @@ class ToolExecutorTest {
   }
 
   @Test
-  @DisplayName("审计失败向上抛出且不重试工具或审计")
-  void auditFailurePropagatesWithoutRetry() {
+  @DisplayName("审计失败不上抛：结果照常返回、不重试工具或审计")
+  void auditFailureDoesNotMaskToolResult() {
     when(httpGet.execute(any())).thenReturn(ToolResult.ok("ok"));
     doThrow(new IllegalStateException("audit unavailable"))
         .when(auditor)
-        .record(eq("s-1"), eq("http_get"), anyString(), eq("ok"), eq(true), isNull(), anyLong());
+        .record(
+            eq("s-1"),
+            eq("agent-x"),
+            eq("http_get"),
+            anyString(),
+            eq("ok"),
+            eq(true),
+            isNull(),
+            anyLong());
 
-    IllegalStateException error =
-        assertThrows(
-            IllegalStateException.class,
+    // 工具已执行完、副作用已发生：审计存储抖动不能让循环把这次执行当失败（否则模型可能重调有副作用的工具）
+    ToolResult result =
+        assertDoesNotThrow(
             () -> executor.execute("s-1", "agent-x", new ToolCallRequest("http_get", "{}")));
 
-    assertEquals("audit unavailable", error.getMessage());
+    assertTrue(result.success());
+    assertEquals("ok", result.content());
     verify(httpGet, times(1)).execute(any());
     verify(auditor, times(1))
-        .record(eq("s-1"), eq("http_get"), anyString(), eq("ok"), eq(true), isNull(), anyLong());
+        .record(
+            eq("s-1"),
+            eq("agent-x"),
+            eq("http_get"),
+            anyString(),
+            eq("ok"),
+            eq(true),
+            isNull(),
+            anyLong());
+  }
+
+  @Test
+  @DisplayName("工具失败且审计也失败：返回的仍是工具的真实错误")
+  void auditFailureOnFailPathKeepsToolError() {
+    when(httpGet.execute(any())).thenThrow(new RuntimeException("connect timeout"));
+    doThrow(new IllegalStateException("audit unavailable"))
+        .when(auditor)
+        .record(any(), any(), anyString(), any(), any(), eq(false), anyString(), anyLong());
+
+    ToolResult result =
+        assertDoesNotThrow(
+            () -> executor.execute("s-1", "agent-x", new ToolCallRequest("http_get", "{}")));
+
+    assertFalse(result.success());
+    assertTrue(result.errorMessage().contains("connect timeout")); // 审计异常不掩盖工具错误
   }
 
   @Test
@@ -96,6 +135,7 @@ class ToolExecutorTest {
     verify(auditor)
         .record(
             eq("s-1"),
+            eq("agent-x"),
             eq("http_get"),
             anyString(),
             isNull(),
@@ -115,6 +155,7 @@ class ToolExecutorTest {
     verify(auditor)
         .record(
             eq("s-1"),
+            eq("agent-x"),
             eq("http_get"),
             anyString(),
             isNull(),
@@ -134,12 +175,31 @@ class ToolExecutorTest {
     verify(auditor)
         .record(
             eq("s-1"),
+            eq("agent-x"),
             eq("no_such_tool"),
             anyString(),
             isNull(),
             eq(false),
             contains("no_such_tool"),
             anyLong());
+  }
+
+  @Test
+  @DisplayName("构造后才注册的工具立刻可执行（管理台 MCP 立即生效）")
+  void toolsRegisteredAfterConstructionAreExecutable() {
+    Map<String, OryxTool> live = new HashMap<>();
+    ToolExecutor liveExecutor = new ToolExecutor(live, auditor);
+    live.put("http_get", httpGet);
+    when(httpGet.execute(any())).thenReturn(ToolResult.ok("ok"));
+
+    ToolResult result =
+        liveExecutor.execute("s-1", "agent-x", new ToolCallRequest("http_get", "{}"));
+
+    assertTrue(result.success());
+    live.remove("http_get");
+    ToolResult gone = liveExecutor.execute("s-1", "agent-x", new ToolCallRequest("http_get", "{}"));
+    assertFalse(gone.success());
+    assertTrue(gone.errorMessage().contains("未注册"));
   }
 
   @Test
@@ -151,6 +211,114 @@ class ToolExecutorTest {
     assertFalse(result.success());
     verify(auditor)
         .record(
-            eq("s-1"), eq("http_get"), anyString(), isNull(), eq(false), anyString(), anyLong());
+            eq("s-1"),
+            eq("agent-x"),
+            eq("http_get"),
+            anyString(),
+            isNull(),
+            eq(false),
+            anyString(),
+            anyLong());
+  }
+
+  @Test
+  @DisplayName("工具完成事件对输入输出中的密钥脱敏")
+  void finishedEventPayloadsAreRedacted() {
+    MemoryEventStore store = new MemoryEventStore();
+    AgentRunEventPublisher publisher =
+        new AgentRunEventPublisher(
+            store,
+            new AgentRunEventHub(),
+            Clock.fixed(Instant.parse("2026-08-23T04:00:00Z"), ZoneOffset.UTC));
+    ToolExecutor live =
+        new ToolExecutor(Map.of("http_get", httpGet), Map.of(), null, auditor, publisher);
+    when(httpGet.execute(any()))
+        .thenReturn(ToolResult.ok("Authorization: Bearer super-secret-token"));
+
+    AgentRunExecutionContext.set(11L);
+    try {
+      live.execute(
+          "s-1",
+          "agent-x",
+          new ToolCallRequest(
+              "http_get", "{\"url\":\"https://example\",\"password\":\"hunter2\"}"));
+    } finally {
+      AgentRunExecutionContext.clear();
+    }
+
+    assertFalse(store.rows.isEmpty());
+    String payloads =
+        store.rows.stream().map(AgentRunEvent::payloadJson).reduce("", String::concat);
+    assertFalse(payloads.contains("hunter2"));
+    assertFalse(payloads.contains("super-secret-token"));
+    assertTrue(payloads.contains("***"));
+  }
+
+  /** 039 US3：工具 span 与审计同区间——成功/失败/策略拦截三路径各补记一次，traceId 取当前上下文。 */
+  @Test
+  @DisplayName("039：成功/失败/被拦三路径均补记 tool span")
+  void spanRecordedOnSuccessFailureAndPolicyBlock() {
+    List<String> spans = new ArrayList<>();
+    executor.setSpanRecorder(
+        new io.oryxos.core.metrics.SpanRecorder() {
+          @Override
+          public void recordToolSpan(
+              String traceId,
+              String toolName,
+              boolean success,
+              boolean blockedByPolicy,
+              long startEpochMs,
+              long durationMs) {
+            spans.add(toolName + ":" + success + ":" + blockedByPolicy + ":" + traceId);
+            assertTrue(durationMs >= 0);
+          }
+        });
+    try (TraceContext.Scope scope = TraceContext.openIfAbsent()) {
+      when(httpGet.execute(any())).thenReturn(ToolResult.ok("ok"));
+      executor.execute("s-1", "agent-x", new ToolCallRequest("http_get", "{}"));
+
+      when(httpGet.execute(any())).thenReturn(ToolResult.error("boom", false));
+      executor.execute("s-1", "agent-x", new ToolCallRequest("http_get", "{}"));
+
+      executor.setToolPolicy(
+          (agent, tool) ->
+              io.oryxos.core.policy.ToolPolicyService.PolicyDecision.denied("策略拒绝")); // 020 拦截路径
+      executor.execute("s-1", "agent-x", new ToolCallRequest("http_get", "{}"));
+
+      assertEquals(3, spans.size());
+      assertTrue(spans.get(0).startsWith("http_get:true:false:" + scope.traceId()));
+      assertTrue(spans.get(1).startsWith("http_get:false:false:"));
+      assertTrue(spans.get(2).startsWith("http_get:false:true:"), "被拦记 blockedByPolicy=true");
+    }
+  }
+
+  private static final class MemoryEventStore implements AgentRunEventStore {
+    final List<AgentRunEvent> rows = new ArrayList<>();
+
+    @Override
+    public synchronized AgentRunEvent append(
+        long runId, String type, String payloadJson, Instant createdAt) {
+      AgentRunEvent event =
+          new AgentRunEvent(runId, rows.size() + 1L, type, createdAt, payloadJson);
+      rows.add(event);
+      return event;
+    }
+
+    @Override
+    public synchronized List<AgentRunEvent> readAfter(long runId, long afterSequence, int limit) {
+      return rows.stream()
+          .filter(event -> event.runId() == runId && event.sequence() > afterSequence)
+          .limit(limit)
+          .toList();
+    }
+
+    @Override
+    public synchronized long lastSequence(long runId) {
+      return rows.stream()
+          .filter(event -> event.runId() == runId)
+          .mapToLong(AgentRunEvent::sequence)
+          .max()
+          .orElse(0L);
+    }
   }
 }

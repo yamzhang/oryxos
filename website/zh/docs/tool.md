@@ -45,12 +45,12 @@ OryxOS 核心内置约两打工具——一组精心挑选的**通用原语**，
 | `move_file` | `FileTools` | 移动 / 重命名文件 | 路径白名单（源 + 目标） |
 | `copy_file` | `FileTools` | 复制文件 | 路径白名单（源 + 目标） |
 | `delete_file` | `FileTools` | 删除文件（拒绝删目录） | 路径白名单 |
-| `shell` | `ShellTools` | 执行 Shell 命令 | 命令白名单 + 元字符扫描 + 超时 |
-| `http_get` / `http_post` | `HttpTools` | HTTP GET / POST | 域名通配符白名单 |
-| `http_request` | `HttpTools` | 任意方法 HTTP（GET/POST/PUT/PATCH/DELETE）+ 请求头 | 域名通配符白名单 |
-| `fetch_webpage` | `HttpTools` | 抓取网页并抽取可读正文（去 HTML） | 域名通配符白名单 |
-| `download_file` | `HttpTools` | 下载 URL 到本地文件 | 域名 + 路径白名单 |
-| `web_search` | `WebSearchTools` | 网络搜索 | 域名通配符白名单 |
+| `shell` | `ShellTools` | 执行 Shell 命令 | 命令白名单 + argv 直传（无 Shell 解释）+ 超时 |
+| `http_get` / `http_post` | `HttpTools` | HTTP GET / POST | GET：默认放行 + SSRF 黑名单；POST：域名通配符白名单 |
+| `http_request` | `HttpTools` | 任意方法 HTTP（GET/POST/PUT/PATCH/DELETE）+ 请求头 | GET：默认放行 + SSRF；写方法：域名通配符白名单 |
+| `fetch_webpage` | `HttpTools` | 抓取网页并抽取可读正文（去 HTML） | 默认放行 + SSRF 黑名单 |
+| `download_file` | `HttpTools` | 下载 URL 到本地文件 | URL：默认放行 + SSRF；本地路径：路径白名单 |
+| `web_search` | `WebSearchTools` | 网络搜索 | 默认放行 + SSRF 黑名单 |
 | `current_time` | `UtilTools` | 返回指定时区的当前时间 | 无（纯计算） |
 | `json_extract` | `UtilTools` | 从 JSON 文本按路径取值 | 无（纯计算） |
 | `save_memory` | `MemoryTools` | 向 `MEMORY.md` 追加文本 | 无（始终允许） |
@@ -71,6 +71,14 @@ OryxOS 核心内置约两打工具——一组精心挑选的**通用原语**，
 | `feishu` | 飞书 / Lark 群机器人 webhook |
 | `wecom` | 企业微信群机器人 webhook |
 | `dingtalk` | 钉钉群机器人 webhook |
+| `slack` | Slack Incoming Webhook 或 Bot Token + channel_id |
+| `discord` | Discord Incoming Webhook 或 Bot Token + channel_id |
+| `telegram` | Telegram Bot API sendMessage |
+| `whatsapp` | WhatsApp Cloud API（会话窗 / 模板） |
+| `teams` | Microsoft Teams Incoming Webhook |
+| `gchat` | Google Chat Incoming Webhook |
+| `mattermost` | Mattermost Incoming Webhook |
+| `matrix` | Matrix Client-Server 发信 |
 | `webhook` | 通用 HTTP webhook |
 
 Agent 在其 **`AGENT.md` 正文**里用自然语言按名引用渠道——例如「调用 notify，把报告发到 `team-lark`」。**AGENT.md frontmatter 中没有 `notify_channels` 字段**；渠道在调用时从注册表解析，因此增加或改指渠道都不用动任何 Agent。
@@ -141,7 +149,16 @@ file:
     - /tmp/oryxos
 ```
 
-**Shell 命令白名单** — 作用于 `shell`。可执行文件（第一个 token）必须在白名单中，同时拒绝 `;`、`&&`、`|`、`$()`、反引号、换行、`>` 等控制、替换和重定向元字符；引号内的字面标点仍可使用。参数不会被单独限制。
+**Shell 可执行文件白名单** — 作用于 `shell`。输入为结构化的 `executable` 和 `arguments` 数组；`ShellTools` 将 argv 直接交给 `ProcessBuilder`，不会启动 Shell，也不会解释管道、重定向、命令替换或命令分隔符。
+
+```json
+{
+  "executable": "grep",
+  "arguments": ["-R", "TODO", "src"]
+}
+```
+
+将 Shell 解释器或语言运行时加入白名单，是管理员对代码执行权限的显式授予：模型可按 OryxOS 进程所属的操作系统身份运行代码。argv 直传能防止 Shell 语法注入，但不隔离解释器的文件或网络影响。对不可信或多租户代码，应使用基于容器/MicroVM 的 `execute_code` Runner；该 Runner 仍处于规划阶段，尚未实现。
 
 ```yaml
 shell:
@@ -150,11 +167,16 @@ shell:
     - cat
     - echo
     - grep
+    - python3 # 可信单机代码执行；不是隔离边界
+  timeout_seconds: 30
 ```
 
 Shell 白名单是一条独立的能力边界。加入 `python`、`python3`、`sh`、`bash` 等解释器或 Shell，等于授予 Agent 该可执行文件的完整能力，并可能绕过文件与 HTTP 工具策略。因此默认配置刻意不包含它们；只有在脚本可信且确实需要扩大权限时才应显式加入。
 
-**HTTP 域名白名单** — 作用于 `http_get` 和 `http_post`。支持 `*` 作为前缀通配符。
+**HTTP 沙箱（读写分治）** — 自第 32 节起，读请求与写请求策略不同：
+
+- **读**（`http_get`、`http_request` 的 GET、`fetch_webpage`、`web_search`、下载 URL）：**默认放行**，仅用 SSRF 黑名单拦截内网 / 回环 / 云元数据等目标。空的 `http.allowed_domains` **不会**禁止公网 GET。
+- **写**（`http_post`、`http_request` 的非 GET）：走 `http.allowed_domains` 域名通配符白名单。空列表表示写请求 deny-all。支持 `*` 作为前缀通配符。
 
 ```yaml
 http:
@@ -165,6 +187,24 @@ http:
 ```
 
 这三个白名单也可在**运行期管理**——通过 `/api/v1/sandbox/whitelist` 接口和管理台，在 `FILE`、`SHELL`、`HTTP` 三类下增删条目，无需重启。
+
+### 给 IM / 业务 Agent 开联网检索
+
+`web_search` / `http_get` / `fetch_webpage` 虽已在运行时全局注册，但 **只有写进该 Agent `AGENT.md` 的 `tools:` 才会出现在模型可调用列表**（见下方「工具注册表」过滤）。常见踩坑：渠道已 `CONNECTED`，用户说「搜一下」却从不调工具——多半是 frontmatter 里只有 `read_file` / `shell` / `notify`。
+
+管理台 / API **新建 Agent** 的脚手架默认已包含下列工具；存量 Agent 仍需手工补上：
+
+```yaml
+tools:
+  - read_file
+  - shell
+  - notify
+  - web_search
+  - http_get
+  - fetch_webpage
+```
+
+建议在正文里写明：需要实时信息时先调 `web_search`。核心阶段搜索走 DuckDuckGo：**Instant Answer JSON 为空时（中文/时效查询常见）会自动再请求 HTML 轻量结果页**；若仍为空，再用 `fetch_webpage` 或对公开 API 使用 `http_get`（例如天气用 `api.open-meteo.com`）。
 
 工具调用未通过沙箱校验时，`ToolExecutor` 返回不可重试的 `ToolResult`，并带有清晰的错误信息说明违反了哪条白名单。该调用仍会记录在 `tool_invocations` 里，`success = false`。
 

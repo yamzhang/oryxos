@@ -6,17 +6,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.oryxos.tool.sandbox.FileSandboxProperties;
+import io.oryxos.tool.sandbox.HttpSandboxProperties;
+import io.oryxos.tool.sandbox.PermissiveSandbox;
+import io.oryxos.tool.sandbox.SandboxViolationException;
+import io.oryxos.tool.sandbox.ShellSandboxProperties;
+import io.oryxos.tool.sandbox.WhitelistSandbox;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientResponseException;
 
 /**
@@ -40,7 +46,7 @@ class WebhookNotifyAdapterTest {
     server = HttpServer.create(new InetSocketAddress(0), 0);
     server.createContext("/", this::record);
     server.start();
-    adapter = new WebhookNotifyAdapter(RestClient.create());
+    adapter = new WebhookNotifyAdapter(new NotifyPoster(new PermissiveSandbox()));
   }
 
   @AfterEach
@@ -107,5 +113,127 @@ class WebhookNotifyAdapterTest {
 
     assertTrue(ex.getMessage().contains("url"), "报错点名缺失的配置键");
     assertEquals(0, received.size(), "零请求发出");
+  }
+
+  @Test
+  @DisplayName("白名单内入口 302 到白名单外应被拦下（通知推送逐跳复检）")
+  void redirectOutsideWhitelistIsBlocked() throws IOException {
+    HttpServer entry = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    HttpServer sink = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    AtomicInteger sinkHits = new AtomicInteger();
+    try {
+      sink.createContext(
+          "/",
+          exchange -> {
+            sinkHits.incrementAndGet();
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+          });
+      String sinkUrl = "http://127.0.0.1:" + sink.getAddress().getPort() + "/sink";
+      entry.createContext(
+          "/",
+          exchange -> {
+            exchange.getResponseHeaders().add("Location", sinkUrl);
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+          });
+      entry.start();
+      sink.start();
+
+      WebhookNotifyAdapter guarded =
+          new WebhookNotifyAdapter(
+              new NotifyPoster(
+                  new WhitelistSandbox(
+                      new FileSandboxProperties(List.of()),
+                      new ShellSandboxProperties(List.of()),
+                      new HttpSandboxProperties(List.of("localhost")))));
+      String start = "http://localhost:" + entry.getAddress().getPort() + "/";
+
+      assertThrows(
+          SandboxViolationException.class, () -> guarded.send(webhookTarget(start), "leaked"));
+      assertEquals(0, sinkHits.get(), "重定向目标不在白名单，请求不该到达 sink");
+    } finally {
+      entry.stop(0);
+      sink.stop(0);
+    }
+  }
+
+  @Test
+  @DisplayName("白名单内 302 不得把通知 POST body 转到下一跳")
+  void redirect302DoesNotReplayPostBody() throws IOException {
+    HttpServer entry = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    HttpServer sink = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    List<String> sinkMethods = new ArrayList<>();
+    List<String> sinkBodies = new ArrayList<>();
+    try {
+      sink.createContext(
+          "/",
+          exchange -> {
+            sinkMethods.add(exchange.getRequestMethod());
+            sinkBodies.add(
+                new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+          });
+      String sinkUrl = "http://127.0.0.1:" + sink.getAddress().getPort() + "/sink";
+      entry.createContext(
+          "/",
+          exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            exchange.getResponseHeaders().add("Location", sinkUrl);
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+          });
+      entry.start();
+      sink.start();
+
+      WebhookNotifyAdapter guarded =
+          new WebhookNotifyAdapter(
+              new NotifyPoster(
+                  new WhitelistSandbox(
+                      new FileSandboxProperties(List.of()),
+                      new ShellSandboxProperties(List.of()),
+                      new HttpSandboxProperties(List.of("localhost", "127.0.0.1")))));
+      String start = "http://localhost:" + entry.getAddress().getPort() + "/";
+
+      guarded.send(webhookTarget(start), "secret-notify");
+
+      assertEquals(List.of("GET"), sinkMethods, "302 下一跳应改为 GET");
+      assertEquals(List.of(""), sinkBodies, "302 不得把通知 body 转到下一跳");
+    } finally {
+      entry.stop(0);
+      sink.stop(0);
+    }
+  }
+
+  @Test
+  @DisplayName("302 无 Location 时不得静默成功")
+  void redirect302WithoutLocationFailsLoud() throws IOException {
+    HttpServer entry = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    try {
+      entry.createContext(
+          "/",
+          exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+          });
+      entry.start();
+
+      WebhookNotifyAdapter guarded =
+          new WebhookNotifyAdapter(
+              new NotifyPoster(
+                  new WhitelistSandbox(
+                      new FileSandboxProperties(List.of()),
+                      new ShellSandboxProperties(List.of()),
+                      new HttpSandboxProperties(List.of("localhost", "127.0.0.1")))));
+      String start = "http://localhost:" + entry.getAddress().getPort() + "/";
+
+      IllegalStateException ex =
+          assertThrows(IllegalStateException.class, () -> guarded.send(webhookTarget(start), "x"));
+      assertTrue(ex.getMessage().contains("Location"), ex.getMessage());
+    } finally {
+      entry.stop(0);
+    }
   }
 }

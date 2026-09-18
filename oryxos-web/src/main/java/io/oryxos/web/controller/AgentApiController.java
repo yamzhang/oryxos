@@ -1,9 +1,19 @@
 package io.oryxos.web.controller;
 
+import io.oryxos.core.OryxTool;
+import io.oryxos.core.agent.AgencyAgentsImporter;
+import io.oryxos.core.agent.AgencyAgentsParser;
+import io.oryxos.core.agent.AgencyAgentsParser.ParsedExpert;
 import io.oryxos.core.agent.AgentExecutionService;
 import io.oryxos.core.agent.AgentLifecycleService;
 import io.oryxos.core.agent.AgentService;
+import io.oryxos.core.agent.AgentValidation;
+import io.oryxos.core.agent.TraceContext;
+import io.oryxos.core.auth.Principal;
+import io.oryxos.core.auth.PrincipalContext;
+import io.oryxos.core.knowledge.KnowledgeBindingService;
 import io.oryxos.core.memory.MemoryService;
+import io.oryxos.core.policy.ResourceRef;
 import io.oryxos.core.profile.ProfileRegistry;
 import io.oryxos.core.session.Message;
 import io.oryxos.core.session.Session;
@@ -14,24 +24,37 @@ import io.oryxos.core.skill.SkillCatalog;
 import io.oryxos.core.skill.SkillCatalogEntry;
 import io.oryxos.web.common.ApiResponse;
 import io.oryxos.web.controller.dto.AgentExecutionView;
+import io.oryxos.web.controller.dto.AgentKnowledgeBindingsView;
 import io.oryxos.web.controller.dto.AgentSkillBindingsView;
 import io.oryxos.web.controller.dto.AgentView;
 import io.oryxos.web.controller.dto.CreateAgentRequest;
 import io.oryxos.web.controller.dto.GenerateFilesRequest;
 import io.oryxos.web.controller.dto.GeneratedFilesView;
+import io.oryxos.web.controller.dto.ImportAgentRequest;
+import io.oryxos.web.controller.dto.ImportPreviewView;
 import io.oryxos.web.controller.dto.MessageRequest;
 import io.oryxos.web.controller.dto.MessageResponse;
+import io.oryxos.web.controller.dto.ReplaceKnowledgeBindingsRequest;
 import io.oryxos.web.controller.dto.ReplaceSkillBindingsRequest;
 import io.oryxos.web.controller.dto.SaveFilesRequest;
 import io.oryxos.web.controller.dto.SessionView;
 import io.oryxos.web.controller.dto.TriggerResponse;
 import io.oryxos.web.controller.dto.UpdateAgentBasicRequest;
 import io.oryxos.web.controller.dto.UpdateAgentRequest;
+import io.oryxos.web.controller.dto.UpdatePersonaRequest;
 import io.oryxos.web.error.ResourceNotFoundException;
+import io.oryxos.web.security.AssetBindGuard;
+import io.oryxos.web.security.PrincipalHolder;
+import io.oryxos.web.security.RuntimeAgentGuard;
+import io.oryxos.web.sse.SseStreamSupport;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -74,6 +97,38 @@ public class AgentApiController {
   private final AgentExecutionService executionService;
   private final AgentSkillBindingService skillBindings;
   private final SkillCatalog skillCatalog;
+  private final KnowledgeBindingService knowledgeBindings;
+  // 025 导入链：容器「tools」Map bean（OryxOsRuntime @Bean），导入器用它做工具名交集；null（测试直构/旧调用点）→ 空集。
+  private final Map<String, OryxTool> tools;
+
+  /** SSE 编排（019）：默认实例保 telescoping 构造与测试直构可用，运行时由 @Autowired setter 覆盖为容器单例。 */
+  private SseStreamSupport sseStreamSupport = SseStreamSupport.defaultSupport();
+
+  @Autowired
+  public void setSseStreamSupport(SseStreamSupport sseStreamSupport) {
+    this.sseStreamSupport = sseStreamSupport;
+  }
+
+  /** 041：绑定/调用的资产门禁。可空以便单测直构——空时不额外 decide（与 flag 关时 ALLOW_ALL 同向：不改变绑定行为）。 */
+  private AssetBindGuard assetBindGuard;
+
+  /** 503：开跑前 decide + PrincipalContext。可空时退化为只 requireAgentRun（无 ThreadLocal）。 */
+  private RuntimeAgentGuard runtimeAgentGuard;
+
+  @Autowired(required = false)
+  public void setAssetBindGuard(AssetBindGuard assetBindGuard) {
+    this.assetBindGuard = assetBindGuard;
+    if (assetBindGuard != null && this.runtimeAgentGuard == null) {
+      this.runtimeAgentGuard = new RuntimeAgentGuard(assetBindGuard);
+    }
+  }
+
+  @Autowired(required = false)
+  public void setRuntimeAgentGuard(RuntimeAgentGuard runtimeAgentGuard) {
+    if (runtimeAgentGuard != null) {
+      this.runtimeAgentGuard = runtimeAgentGuard;
+    }
+  }
 
   public AgentApiController(
       AgentLifecycleService lifecycle,
@@ -89,6 +144,7 @@ public class AgentApiController {
         profileRegistry,
         memoryService,
         executionService,
+        null,
         null,
         null);
   }
@@ -109,6 +165,52 @@ public class AgentApiController {
         memoryService,
         executionService,
         skillBindings,
+        null,
+        null);
+  }
+
+  public AgentApiController(
+      AgentLifecycleService lifecycle,
+      AgentService agentService,
+      SessionManager sessionManager,
+      ProfileRegistry profileRegistry,
+      MemoryService memoryService,
+      AgentExecutionService executionService,
+      AgentSkillBindingService skillBindings,
+      SkillCatalog skillCatalog) {
+    this(
+        lifecycle,
+        agentService,
+        sessionManager,
+        profileRegistry,
+        memoryService,
+        executionService,
+        skillBindings,
+        skillCatalog,
+        null);
+  }
+
+  /** 源码兼容旧 9 参调用点（telescoping 链 / 测试直构）：tools 置 null，导入端点退化为空工具交集。 */
+  public AgentApiController(
+      AgentLifecycleService lifecycle,
+      AgentService agentService,
+      SessionManager sessionManager,
+      ProfileRegistry profileRegistry,
+      MemoryService memoryService,
+      AgentExecutionService executionService,
+      AgentSkillBindingService skillBindings,
+      SkillCatalog skillCatalog,
+      KnowledgeBindingService knowledgeBindings) {
+    this(
+        lifecycle,
+        agentService,
+        sessionManager,
+        profileRegistry,
+        memoryService,
+        executionService,
+        skillBindings,
+        skillCatalog,
+        knowledgeBindings,
         null);
   }
 
@@ -121,7 +223,9 @@ public class AgentApiController {
       MemoryService memoryService,
       AgentExecutionService executionService,
       AgentSkillBindingService skillBindings,
-      SkillCatalog skillCatalog) {
+      SkillCatalog skillCatalog,
+      KnowledgeBindingService knowledgeBindings,
+      @Qualifier("tools") Map<String, OryxTool> tools) {
     this.lifecycle = lifecycle;
     this.agentService = agentService;
     this.sessionManager = sessionManager;
@@ -130,6 +234,8 @@ public class AgentApiController {
     this.executionService = executionService;
     this.skillBindings = skillBindings;
     this.skillCatalog = skillCatalog;
+    this.knowledgeBindings = knowledgeBindings;
+    this.tools = tools;
   }
 
   /** 创建：只需 name + description，后台按模板脚手架出完整目录 + 派生注册（失败回滚）。 */
@@ -138,15 +244,23 @@ public class AgentApiController {
     if (req == null || req.name() == null || req.name().isBlank()) {
       throw new IllegalArgumentException("Agent 名为空");
     }
-    return ApiResponse.ok(
-        view(
-            lifecycle.create(
-                req.name(), req.description(), req.provider(), req.model(), req.skillBindings())));
+    io.oryxos.core.profile.Profile created =
+        lifecycle.create(
+            req.name(), req.description(), req.provider(), req.model(), req.skillBindings());
+    // 014 FR-018：新建表单的知识库多选在此落软连接（绑定仅管理面动作；失败时 Agent 已建、错误可读可重试）
+    if (!req.knowledgeBindings().isEmpty()) {
+      requireKnowledgeBindings().replaceBindings(req.name(), req.knowledgeBindings());
+    }
+    return ApiResponse.ok(view(created));
   }
 
   @GetMapping
-  public ApiResponse<List<AgentView>> list() {
-    return ApiResponse.ok(lifecycle.list().stream().map(this::view).toList());
+  public ApiResponse<List<AgentView>> list(HttpServletRequest request) {
+    return ApiResponse.ok(
+        lifecycle.list().stream()
+            .filter(p -> isCatalogVisible(request, ResourceRef.agent(p.name())))
+            .map(this::view)
+            .toList());
   }
 
   @GetMapping("/{name}")
@@ -191,9 +305,37 @@ public class AgentApiController {
             lifecycle.updateBasicInfo(name, req.description(), req.provider(), req.model())));
   }
 
+  /**
+   * 结构化编辑人格（025 persona 段）：只改 AGENT.md frontmatter 的 persona 块，正文与其他配置原样保留。缺 name/role → 400； Agent
+   * 不存在 → 404。
+   */
+  @PutMapping("/{name}/persona")
+  public ApiResponse<AgentView> updatePersona(
+      @PathVariable String name, @RequestBody UpdatePersonaRequest req) {
+    if (lifecycle.get(name).isEmpty()) {
+      throw new ResourceNotFoundException("Agent 不存在: " + name); // → 404
+    }
+    io.oryxos.core.profile.Profile.Persona persona =
+        req == null
+            ? null
+            : new io.oryxos.core.profile.Profile.Persona(
+                req.name(),
+                req.role(),
+                req.traits(),
+                req.tone(),
+                req.values(),
+                req.boundaries(),
+                req.sampleStyle());
+    return ApiResponse.ok(view(lifecycle.updatePersona(name, persona)));
+  }
+
+  /** 019：Accept 含 text/event-stream 时 SSE 流式（校验前置，FR-009）；否则一次性 JSON 路径零改动。 */
   @PostMapping("/{name}/invoke")
   public ApiResponse<MessageResponse> invoke(
-      @PathVariable String name, @RequestBody MessageRequest req) {
+      @PathVariable String name,
+      @RequestBody MessageRequest req,
+      HttpServletRequest request,
+      HttpServletResponse response) {
     if (req == null || req.content() == null || req.content().isEmpty()) {
       throw new IllegalArgumentException("消息为空"); // → 400
     }
@@ -201,8 +343,23 @@ public class AgentApiController {
       throw new IllegalArgumentException("消息超过 32KB 上限"); // → 400
     }
     requireAgent(name);
-    String reply = agentService.processStateless(name, req.content());
-    return ApiResponse.ok(new MessageResponse(reply));
+    requireAgentRun(request, name);
+    // 021：controller 先 open 拿 ID 回传调用方；AgentService 兜底 openIfAbsent 复用同一 ID
+    try (TraceContext.Scope traceScope = TraceContext.openIfAbsent()) {
+      bindPrincipal(request);
+      try {
+        if (SseStreamSupport.wantsEventStream(request)) {
+          String content = req.content();
+          sseStreamSupport.stream(
+              response, listener -> agentService.processStateless(name, content, listener));
+          return null; // 响应已由 SSE 流写出并提交（trace 事件由 SseStreamSupport 发出）
+        }
+        String reply = agentService.processStateless(name, req.content());
+        return ApiResponse.ok(new MessageResponse(reply, traceScope.traceId()));
+      } finally {
+        RuntimeAgentGuard.clear();
+      }
+    }
   }
 
   /** 这个 Agent 的专属长期记忆（30 节：记忆跟着 Agent 走）。 */
@@ -221,10 +378,16 @@ public class AgentApiController {
         new SessionView(session.sessionId(), session.profileName(), recent(session.messages())));
   }
 
-  /** 往固定管理台会话发一条消息，触发 ReAct（同 invoke 入口，但落在这个 Agent 的固定会话里，累积上下文）。 */
+  /**
+   * 往固定管理台会话发一条消息，触发 ReAct（同 invoke 入口，但落在这个 Agent 的固定会话里，累积上下文）。
+   * 019：管理台聊天页的流式载体端点（FR-013/R5），Accept 分流规则与 invoke 一致。
+   */
   @PostMapping("/{name}/session/messages")
   public ApiResponse<MessageResponse> consoleSend(
-      @PathVariable String name, @RequestBody MessageRequest req) {
+      @PathVariable String name,
+      @RequestBody MessageRequest req,
+      HttpServletRequest request,
+      HttpServletResponse response) {
     if (req == null || req.content() == null || req.content().isEmpty()) {
       throw new IllegalArgumentException("消息为空"); // → 400
     }
@@ -232,8 +395,25 @@ public class AgentApiController {
       throw new IllegalArgumentException("消息超过 32KB 上限"); // → 400
     }
     requireAgent(name);
+    requireAgentRun(request, name);
     Session session = sessionManager.getOrCreate(CONSOLE_CHANNEL, CONSOLE_USER, name);
-    return ApiResponse.ok(new MessageResponse(agentService.process(session, req.content())));
+    // 021：同 invoke——先 open 回传，流式路径由 SseStreamSupport 发 trace 事件
+    try (TraceContext.Scope traceScope = TraceContext.openIfAbsent()) {
+      bindPrincipal(request);
+      try {
+        if (SseStreamSupport.wantsEventStream(request)) {
+          String content = req.content();
+          sseStreamSupport.stream(
+              response, listener -> agentService.process(session, content, listener));
+          return null; // 响应已由 SSE 流写出并提交
+        }
+        return ApiResponse.ok(
+            new MessageResponse(
+                agentService.process(session, req.content()), traceScope.traceId()));
+      } finally {
+        RuntimeAgentGuard.clear();
+      }
+    }
   }
 
   /**
@@ -242,7 +422,9 @@ public class AgentApiController {
    */
   @PostMapping("/{name}/trigger")
   public ApiResponse<TriggerResponse> trigger(
-      @PathVariable String name, @RequestBody(required = false) MessageRequest req) {
+      @PathVariable String name,
+      @RequestBody(required = false) MessageRequest req,
+      HttpServletRequest request) {
     requireAgent(name);
     String message =
         req == null || req.content() == null || req.content().isBlank()
@@ -251,13 +433,20 @@ public class AgentApiController {
     if (message.length() > MAX_MESSAGE_LENGTH) {
       throw new IllegalArgumentException("消息超过 32KB 上限"); // → 400
     }
+    Principal actor = authorizeCapture(request, name);
     Session session = sessionManager.getOrCreate(CONSOLE_CHANNEL, CONSOLE_USER, name);
     long executionId =
         executionService.triggerAsync(
             name,
             TRIGGER_SOURCE_MANUAL,
             session.sessionId(),
-            () -> agentService.process(session, message));
+            message,
+            () ->
+                runWithPrincipal(
+                    actor,
+                    () -> {
+                      agentService.process(session, message);
+                    }));
     return ApiResponse.ok(new TriggerResponse(executionId, "RUNNING"));
   }
 
@@ -289,10 +478,99 @@ public class AgentApiController {
   @PostMapping("/{name}/files")
   public ApiResponse<AgentView> saveFiles(
       @PathVariable String name, @RequestBody SaveFilesRequest req) {
+    io.oryxos.core.profile.Profile saved =
+        lifecycle.saveFiles(
+            name, req == null ? null : req.files(), req == null ? null : req.skillBindings());
+    // 014 FR-018：生成/编辑保存时同步知识库绑定（null = 不改动）
+    if (req != null && req.knowledgeBindings() != null) {
+      requireKnowledgeBindings().replaceBindings(name, req.knowledgeBindings());
+    }
+    return ApiResponse.ok(view(saved));
+  }
+
+  /**
+   * 导入预览（025）：解析 agency-agents 源文件 → 渲染成 AGENT.md 全文 + 字段投影 + 派生名 + dry-run 校验，不落盘、不注册。 dry-run
+   * 校验不抛——预览永远 200，失败体现在 validation.valid=false + message。
+   */
+  @PostMapping("/import-preview")
+  public ApiResponse<ImportPreviewView> importPreview(@RequestBody ImportAgentRequest req) {
+    if (req == null || req.sourceContent() == null || req.sourceContent().isBlank()) {
+      throw new IllegalArgumentException("源文件内容为空"); // → 400
+    }
+    ParsedExpert expert = new AgencyAgentsParser().parse(req.sourceContent());
+    String name = resolveImportName(req.name(), expert);
+    String rendered =
+        new AgencyAgentsImporter()
+            .toMarkdown(
+                expert,
+                resolveImportProvider(req),
+                tools == null ? Set.of() : tools.keySet(),
+                name,
+                req.model());
+    AgentValidation validation = lifecycle.validateAgent(name, rendered);
     return ApiResponse.ok(
-        view(
-            lifecycle.saveFiles(
-                name, req == null ? null : req.files(), req == null ? null : req.skillBindings())));
+        new ImportPreviewView(
+            name,
+            rendered,
+            ImportPreviewView.ImportExpertView.from(expert),
+            ImportPreviewView.ValidationView.from(validation)));
+  }
+
+  /** 导入落地（025）：渲染 + 校验通过 → 真正创建 Agent。同名已有 → 400（只创建不覆盖，先删再导）。 */
+  @PostMapping("/import")
+  public ApiResponse<AgentView> importAgent(@RequestBody ImportAgentRequest req) {
+    if (req == null || req.sourceContent() == null || req.sourceContent().isBlank()) {
+      throw new IllegalArgumentException("源文件内容为空"); // → 400
+    }
+    ParsedExpert expert = new AgencyAgentsParser().parse(req.sourceContent());
+    String name = resolveImportName(req.name(), expert);
+    String rendered =
+        new AgencyAgentsImporter()
+            .toMarkdown(
+                expert,
+                resolveImportProvider(req),
+                tools == null ? Set.of() : tools.keySet(),
+                name,
+                req.model());
+    return ApiResponse.ok(view(lifecycle.importAgent(name, rendered)));
+  }
+
+  // ---- 知识库绑定三件套 + 整体替换（014 FR-002/018/019：绑定仅管理面动作，运行时无自改工具）----
+
+  @GetMapping("/{name}/knowledge")
+  public ApiResponse<AgentKnowledgeBindingsView> knowledge(@PathVariable String name) {
+    requireAgent(name);
+    return ApiResponse.ok(
+        AgentKnowledgeBindingsView.from(requireKnowledgeBindings().inspect(name)));
+  }
+
+  @PutMapping("/{name}/knowledge/{kb}")
+  public ApiResponse<AgentKnowledgeBindingsView> bindKnowledge(
+      @PathVariable String name, @PathVariable String kb, HttpServletRequest request) {
+    requireAgent(name);
+    requireKnowledgeBind(request, kb);
+    requireKnowledgeBindings().bind(name, kb);
+    return knowledge(name);
+  }
+
+  @DeleteMapping("/{name}/knowledge/{kb}")
+  public ApiResponse<AgentKnowledgeBindingsView> unbindKnowledge(
+      @PathVariable String name, @PathVariable String kb) {
+    requireAgent(name);
+    requireKnowledgeBindings().unbind(name, kb);
+    return knowledge(name);
+  }
+
+  @PutMapping("/{name}/knowledge")
+  public ApiResponse<AgentKnowledgeBindingsView> replaceKnowledge(
+      @PathVariable String name,
+      @RequestBody ReplaceKnowledgeBindingsRequest body,
+      HttpServletRequest request) {
+    requireAgent(name);
+    List<String> desired = body == null ? List.of() : body.knowledge();
+    requireKnowledgeBinds(request, desired);
+    return ApiResponse.ok(
+        AgentKnowledgeBindingsView.from(requireKnowledgeBindings().replaceBindings(name, desired)));
   }
 
   @GetMapping("/{name}/skills")
@@ -303,8 +581,9 @@ public class AgentApiController {
 
   @PutMapping("/{name}/skills/{skill}")
   public ApiResponse<AgentSkillBindingsView> bind(
-      @PathVariable String name, @PathVariable String skill) {
+      @PathVariable String name, @PathVariable String skill, HttpServletRequest request) {
     requireAgent(name);
+    requireSkillBind(request, skill);
     requireSkillsExist(List.of(skill));
     validateCatalog(List.of(skill));
     requireBindings().bind(name, skill);
@@ -321,9 +600,12 @@ public class AgentApiController {
 
   @PutMapping("/{name}/skills")
   public ApiResponse<AgentSkillBindingsView> replaceSkills(
-      @PathVariable String name, @RequestBody ReplaceSkillBindingsRequest request) {
+      @PathVariable String name,
+      @RequestBody ReplaceSkillBindingsRequest body,
+      HttpServletRequest request) {
     requireAgent(name);
-    List<String> desired = request == null ? List.of() : request.skills();
+    List<String> desired = body == null ? List.of() : body.skills();
+    requireSkillBinds(request, desired);
     requireSkillsExist(desired);
     validateCatalog(desired);
     return ApiResponse.ok(
@@ -340,6 +622,78 @@ public class AgentApiController {
     return AgentView.from(profile, skills);
   }
 
+  private void requireAgentRun(HttpServletRequest request, String name) {
+    if (runtimeAgentGuard != null) {
+      runtimeAgentGuard.bindForRun(request, name);
+      return;
+    }
+    if (assetBindGuard != null) {
+      assetBindGuard.requireAgentRun(request, name);
+      PrincipalContext.set(PrincipalHolder.get(request));
+    }
+  }
+
+  /** 列表过滤：未装配守卫时不过滤（单测 / 早期装配）。 */
+  private boolean isCatalogVisible(HttpServletRequest request, ResourceRef resource) {
+    return assetBindGuard == null || assetBindGuard.isVisible(request, resource);
+  }
+
+  private void bindPrincipal(HttpServletRequest request) {
+    if (PrincipalContext.current() == null) {
+      PrincipalContext.set(PrincipalHolder.get(request));
+    }
+  }
+
+  private Principal authorizeCapture(HttpServletRequest request, String name) {
+    if (runtimeAgentGuard != null) {
+      return runtimeAgentGuard.authorizeAndCapture(request, name);
+    }
+    // 异步路径：只 decide，不装 ThreadLocal（request 线程与后台线程分离）
+    if (assetBindGuard != null) {
+      assetBindGuard.requireAgentRun(request, name);
+    }
+    return PrincipalHolder.get(request);
+  }
+
+  private static void runWithPrincipal(Principal principal, Runnable work) {
+    RuntimeAgentGuard.install(principal);
+    try {
+      work.run();
+    } finally {
+      RuntimeAgentGuard.clear();
+    }
+  }
+
+  private void requireSkillBind(HttpServletRequest request, String skill) {
+    if (assetBindGuard != null) {
+      assetBindGuard.requireSkillBind(request, skill);
+    }
+  }
+
+  private void requireSkillBinds(HttpServletRequest request, List<String> skills) {
+    if (skills == null) {
+      return;
+    }
+    for (String skill : skills) {
+      requireSkillBind(request, skill);
+    }
+  }
+
+  private void requireKnowledgeBind(HttpServletRequest request, String kb) {
+    if (assetBindGuard != null) {
+      assetBindGuard.requireKnowledgeBind(request, kb);
+    }
+  }
+
+  private void requireKnowledgeBinds(HttpServletRequest request, List<String> knowledge) {
+    if (knowledge == null) {
+      return;
+    }
+    for (String kb : knowledge) {
+      requireKnowledgeBind(request, kb);
+    }
+  }
+
   private void requireAgent(String name) {
     if (profileRegistry.get(name).isEmpty()) {
       throw new ResourceNotFoundException("Agent 不存在: " + name);
@@ -351,6 +705,13 @@ public class AgentApiController {
       throw new IllegalStateException("Agent Skill 绑定服务未装配");
     }
     return skillBindings;
+  }
+
+  private KnowledgeBindingService requireKnowledgeBindings() {
+    if (knowledgeBindings == null) {
+      throw new IllegalStateException("Agent 知识库绑定服务未装配");
+    }
+    return knowledgeBindings;
   }
 
   private void requireSkillsExist(List<String> names) {
@@ -384,6 +745,27 @@ public class AgentApiController {
         throw new IllegalArgumentException("Skill 不在可访问且已安装的 catalog 中: " + name);
       }
     }
+  }
+
+  /** 025 导入：显式 name 优先；缺省从源 displayName 去掉非 {@code [A-Za-z0-9_-]} 字符派生（中文展示名不进 profile 名）。 */
+  private static String resolveImportName(String name, ParsedExpert expert) {
+    String n = name == null ? "" : name.strip();
+    if (!n.isEmpty()) {
+      return n;
+    }
+    String slug =
+        expert.displayName() == null ? "" : expert.displayName().replaceAll("[^A-Za-z0-9_-]", "");
+    if (slug.isEmpty()) {
+      throw new IllegalArgumentException("无法从源文件派生 Agent 名，请显式提供 name"); // → 400
+    }
+    return slug;
+  }
+
+  /** 导入用 provider：请求显式选择优先（导入弹框有 provider 下拉）；未选才跟随底座默认 provider。 */
+  private String resolveImportProvider(ImportAgentRequest req) {
+    return req.provider() == null || req.provider().isBlank()
+        ? lifecycle.defaultProvider()
+        : req.provider();
   }
 
   private static List<Message> recent(List<Message> messages) {

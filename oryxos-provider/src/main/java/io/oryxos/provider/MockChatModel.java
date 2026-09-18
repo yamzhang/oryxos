@@ -27,8 +27,33 @@ import org.springframework.ai.chat.prompt.Prompt;
  */
 public class MockChatModel implements ChatModel {
 
+  /**
+   * 039 US4：可选固定时延（毫秒），模拟真实 LLM 往返供吞吐线性性压测——系统属性 {@code -Doryxos.mock.latency-ms=800}（K8s 走 Helm
+   * values 的 env.javaOpts 注入）。 默认 0 = 现状零变化。
+   */
+  private static final String LATENCY_PROP = "oryxos.mock.latency-ms";
+
+  private final long latencyMs;
+
+  public MockChatModel() {
+    long configured = 0L;
+    try {
+      configured = Long.getLong(LATENCY_PROP, 0L);
+    } catch (RuntimeException ignored) {
+      // 非法值按 0 处理（mock 面不因配置笔误拒启）
+    }
+    this.latencyMs = Math.max(0L, configured);
+  }
+
   @Override
   public ChatResponse call(Prompt prompt) {
+    if (latencyMs > 0) {
+      try {
+        Thread.sleep(latencyMs); // 虚拟线程上阻塞即让出 carrier（宪法 VII 形态）
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
     List<Message> messages = prompt.getInstructions();
     Message last = messages.isEmpty() ? null : messages.get(messages.size() - 1);
     // 最后一条是工具结果 → 工具已回填，第二轮收尾；否则最近是用户消息、第一轮触发 save_memory。
@@ -49,6 +74,29 @@ public class MockChatModel implements ChatModel {
             .toolCalls(List.of(toolCall))
             .build());
   }
+
+  /**
+   * 流式形态（019 R7）：终局文本轮按固定粒度切段逐 chunk 流出（无 key 可验「多 token + 拼接一致」）； 工具调用轮单 chunk 原样发出（工具轮 content
+   * 为空，与真实 provider 的常规形态一致，R3）。
+   */
+  @Override
+  public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+    ChatResponse full = call(prompt);
+    AssistantMessage output = full.getResult().getOutput();
+    String text = output.getText();
+    if (!output.getToolCalls().isEmpty() || text == null || text.isEmpty()) {
+      return reactor.core.publisher.Flux.just(full);
+    }
+    java.util.List<ChatResponse> chunks = new java.util.ArrayList<>();
+    for (int i = 0; i < text.length(); i += STREAM_CHUNK_CHARS) {
+      String piece = text.substring(i, Math.min(text.length(), i + STREAM_CHUNK_CHARS));
+      chunks.add(single(new AssistantMessage(piece)));
+    }
+    return reactor.core.publisher.Flux.fromIterable(chunks);
+  }
+
+  /** 流式切段粒度（字符）：足够小以产生多个 token 事件，足够大避免测试噪音。 */
+  private static final int STREAM_CHUNK_CHARS = 4;
 
   private static ChatResponse single(AssistantMessage message) {
     return new ChatResponse(List.of(new Generation(message)));

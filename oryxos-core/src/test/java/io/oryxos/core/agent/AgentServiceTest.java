@@ -55,10 +55,7 @@ class AgentServiceTest {
     sessionManager = mock(SessionManager.class);
     agentService =
         new AgentService(
-            new ProfileRegistry(Map.of("ops-agent", profile)),
-            reActLoop,
-            sessionManager,
-            mock(io.oryxos.core.memory.MemoryService.class));
+            new ProfileRegistry(Map.of("ops-agent", profile)), reActLoop, sessionManager);
     session = new Session("s-1", "ops-agent");
   }
 
@@ -175,10 +172,7 @@ class AgentServiceTest {
             new Profile.Settings(10, 2));
     AgentService boundedService =
         new AgentService(
-            new ProfileRegistry(Map.of("ops-agent", boundedProfile)),
-            reActLoop,
-            sessionManager,
-            mock(io.oryxos.core.memory.MemoryService.class));
+            new ProfileRegistry(Map.of("ops-agent", boundedProfile)), reActLoop, sessionManager);
     Session latest = new Session("s-1", "ops-agent");
     latest.appendUser("问题1");
     latest.appendUser("问题2");
@@ -196,6 +190,17 @@ class AgentServiceTest {
 
     assertEquals(List.of("问题3", "问题4"), latest.messages().stream().map(Message::content).toList());
     verify(sessionManager).saveIfUnchanged(latest, baseline);
+  }
+
+  @Test
+  @DisplayName("正常结束后不依赖 MemoryService：触发足迹不再写归档（#206）")
+  void processSucceedsWithoutWritingTriggerFootprint() {
+    when(reActLoop.run(any(), any(), any())).thenReturn("很抱歉，我没有找到");
+
+    String reply = agentService.process(session, "上次那个部署的坑怎么处理的");
+
+    assertEquals("很抱歉，我没有找到", reply);
+    verify(sessionManager).saveIfUnchanged(session, List.of());
   }
 
   @Test
@@ -228,5 +233,55 @@ class AgentServiceTest {
 
     verify(sessionManager, never()).save(any());
     assertNull(ProfileContext.current());
+  }
+
+  @Test
+  @DisplayName("039：turn 根 span 与 Scope 同源——成功 success=true、循环异常 success=false")
+  void turnSpanRecordedWithTraceIdOnSuccessAndFailure() {
+    java.util.List<String> spans = new java.util.ArrayList<>();
+    agentService.setSpanRecorder(
+        new io.oryxos.core.metrics.SpanRecorder() {
+          @Override
+          public void recordTurnSpan(
+              String traceId,
+              String agentName,
+              String channel,
+              boolean success,
+              long startEpochMs,
+              long durationMs) {
+            spans.add(agentName + ":" + success + ":" + (traceId != null && !traceId.isBlank()));
+          }
+        });
+    when(reActLoop.run(any(), any(), any())).thenReturn("ok");
+    agentService.process(session, "hi");
+
+    when(reActLoop.run(any(), any(), any())).thenThrow(new IllegalStateException("provider down"));
+    org.junit.jupiter.api.Assertions.assertThrows(
+        IllegalStateException.class, () -> agentService.process(session, "hi"));
+
+    org.junit.jupiter.api.Assertions.assertEquals(
+        java.util.List.of("ops-agent:true:true", "ops-agent:false:true"), spans);
+  }
+
+  @Test
+  @DisplayName("039：无状态一轮（invoke/群聊）同样补记 turn span")
+  void statelessTurnSpanRecorded() {
+    java.util.List<String> spans = new java.util.ArrayList<>();
+    agentService.setSpanRecorder(
+        new io.oryxos.core.metrics.SpanRecorder() {
+          @Override
+          public void recordTurnSpan(
+              String traceId,
+              String agentName,
+              String channel,
+              boolean success,
+              long startEpochMs,
+              long durationMs) {
+            spans.add(agentName + ":" + success);
+          }
+        });
+    when(reActLoop.run(any(), any(), any())).thenReturn("ok");
+    agentService.processStateless("ops-agent", "hi");
+    org.junit.jupiter.api.Assertions.assertEquals(java.util.List.of("ops-agent:true"), spans);
   }
 }
